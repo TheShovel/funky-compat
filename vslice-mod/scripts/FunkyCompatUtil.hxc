@@ -789,6 +789,12 @@ class FunkyCompatUtil
     return ['assets/images/$rel', 'shared:assets/shared/images/$rel'];
   }
 
+  // Keys for an OpenGL shader (.frag): preload + shared library.
+  public function shaderKeys(rel:String):Array<String>
+  {
+    return ['assets/shaders/$rel', 'shared:assets/shared/shaders/$rel'];
+  }
+
   // Keys for song audio: songs:assets/songs/<songId>/<file>
   public function songAudioKeys(songId:String, file:String):Array<String>
   {
@@ -1168,11 +1174,12 @@ class FunkyCompatUtil
     return null;
   }
 
-  // Decode a PNG into an alpha grid using the game's own image decoder
-  // (lime.graphics.Image - the same native path every texture the game loads
-  // goes through, so it cannot crash the way a hand-rolled zlib inflate can).
-  // Returns {w, h, alpha: haxe.io.Bytes} (alpha[row*w + col], 0-255) or null.
-  public function decodePngAlpha(pngRel:String):Dynamic
+  // Open a PNG and expose its raw pixel buffer (ZERO-COPY) for row sampling.
+  // Returns {w, h, hb: haxe.io.Bytes, aOff: Int} or null. The previous
+  // approach materialized a full w*h alpha grid via an interpreted per-pixel
+  // copy loop, which took minutes on large stage art (gumballs) - row
+  // sampling against the live buffer with early exits is effectively free.
+  public function openPngPixels(pngRel:String):Dynamic
   {
     if (pngMetricsCache == null) pngMetricsCache = {};
     var cached:Dynamic = ReflectUtil.getField(this.pngMetricsCache, pngRel);
@@ -1189,21 +1196,14 @@ class FunkyCompatUtil
         {
           var w:Int = img.width;
           var h:Int = img.height;
-          var alpha:Bytes = Bytes.alloc(w * h);
-          // Read alpha straight from the raw pixel buffer (a plain Bytes
-          // .get() loop - no per-pixel native calls that could crash the
-          // process the way Image.getPixel loops can). Lime's PNG decode
-          // yields a 32-bit format; the alpha byte sits at offset 3 for
-          // R/G/B/A variants and offset 0 for A/R/G/B variants.
           var bd:Dynamic = img.buffer.data;
           var fmt:String = '' + Std.string(img.buffer.format);
           var aOff:Int = -1;
           if (bd != null)
           {
-            // lime's PixelFormat renders as an int on some cpp builds: 0 =
-            // RGBA32, 1 = ARGB32, 2 = BGRA32, 3 = ABGR32. Byte ordering:
-            // R,G,B,A for the RGBA/BGRA variants (alpha at byte 3), A,R,G,B
-            // for the ARGB/ABGR variants (alpha at byte 0).
+            // lime PixelFormat as int on cpp builds: 0=RGBA32, 1=ARGB32,
+            // 2=BGRA32, 3=ABGR32. Alpha sits at byte 3 (RGBA/BGRA order)
+            // or byte 0 (ARGB/ABGR order).
             if (fmt == '0' || fmt == '2' || StringTools.startsWith(fmt, 'RGBA') || StringTools.startsWith(fmt, 'BGRA'))
             {
               aOff = 3;
@@ -1213,19 +1213,14 @@ class FunkyCompatUtil
               aOff = 0;
             }
           }
-          if (aOff >= 0)
+          if (aOff >= 0 && bd != null)
           {
-            // img.buffer.data is a typed-array view (length/byteLength) whose
-            // .buffer wraps the raw bytes as a lime ByteArray - a
-            // haxe.io.Bytes subclass. Its 'b' field IS the byte storage, and
-            // HScript cannot call methods on the view directly, so wrap that
-            // field in a plain Bytes (zero-copy) and scan it.
+            // bd is a typed-array view whose .buffer wraps the raw bytes
+            // (lime ByteArray); its 'b' field IS the storage. Wrap it in a
+            // plain Bytes (zero-copy) and sanity-check the size.
             var hb:Bytes = null;
             try
             {
-              // bd is a typed-array view over the pixel storage; the view's
-              // .buffer wraps the raw bytes (lime Bytes). Pull its 'b' field
-              // and wrap it in a plain Bytes (zero-copy), verifying the size.
               var buf:Dynamic = ReflectUtil.getField(bd, 'buffer');
               var bufData:Dynamic = buf == null ? null : ReflectUtil.getField(buf, 'b');
               if (bufData != null)
@@ -1235,27 +1230,8 @@ class FunkyCompatUtil
               }
             }
             catch (e:Dynamic) {}
-            if (hb == null)
-            {
-              // Cannot read pixels safely; keep the old box-based behavior.
-              return null;
-            }
-            var stride:Int = w * 4;
-            for (y in 0...h)
-            {
-              var rowBase:Int = y * stride + aOff;
-              var outBase:Int = y * w;
-              for (x in 0...w)
-              {
-                alpha.set(outBase + x, hb.get(rowBase + x * 4));
-              }
-            }
+            if (hb != null) out = {w: w, h: h, hb: hb, aOff: aOff};
           }
-          else
-          {
-            for (i in 0...(w * h)) alpha.set(i, 255);
-          }
-          out = {w: w, h: h, alpha: alpha};
         }
       }
     }
@@ -1266,6 +1242,19 @@ class FunkyCompatUtil
     return out;
   }
 
+  // Count opaque (>16) pixels in one source-image row segment.
+  function rowDenseCount(px:Dynamic, row:Int, rx:Int, rw:Int):Int
+  {
+    var cnt:Int = 0;
+    var base:Int = row * px.w * 4 + px.aOff;
+    var hb:Bytes = px.hb;
+    for (x in 0...rw)
+    {
+      if (hb.get(base + x * 4) > 16) cnt++;
+    }
+    return cnt;
+  }
+
   // Lowest dense pixel row (from the box bottom) across a prop's atlas
   // frames, in source pixels. The author's crowd art usually has a few empty
   // rows of padding below the drawn feet; this returns how far up the drawn
@@ -1273,10 +1262,8 @@ class FunkyCompatUtil
   public function propFeetInset(pngRel:String, frames:Array<Dynamic>):Int
   {
     if (frames == null || frames.length == 0) return 0;
-    var img:Dynamic = decodePngAlpha(pngRel);
-    if (img == null) return 0;
-    var W:Int = img.w;
-    var alpha:Bytes = img.alpha;
+    var px:Dynamic = openPngPixels(pngRel);
+    if (px == null) return 0;
     var best:Int = -1;
     for (fr in frames)
     {
@@ -1286,22 +1273,21 @@ class FunkyCompatUtil
       var rh:Int = fieldInt(fr, 'ch');
       var fy:Int = fieldInt(fr, 'fy');
       var fh:Int = fieldInt(fr, 'fh');
-      if (rw <= 0 || rh <= 0 || fh <= 0 || ry + rh > img.h) continue;
+      if (rw <= 0 || rh <= 0 || fh <= 0 || ry + rh > px.h) continue;
       var threshold:Int = Std.int(rw * 0.05);
       if (threshold < 1) threshold = 1;
-      // Scan top-to-bottom, keeping the last dense row: that is the LOWEST
-      // dense row (the drawn feet). A descending `for (r in (rh-1)...-1)`
-      // would be clearer but descending ranges crash on some targets.
+      // Scan bottom-up with an early exit: the drawn feet are the LOWEST
+      // dense row, usually within a few rows of the frame bottom.
       var feetRow:Int = -1;
-      for (r in 0...rh)
+      var r:Int = rh - 1;
+      while (r >= 0)
       {
-        var cnt:Int = 0;
-        var base:Int = (ry + r) * W + rx;
-        for (x in 0...rw)
+        if (rowDenseCount(px, ry + r, rx, rw) >= threshold)
         {
-          if (alpha.get(base + x) > 16) cnt++;
+          feetRow = r;
+          r = 0;
         }
-        if (cnt >= threshold) feetRow = r;
+        r--;
       }
       if (feetRow >= 0)
       {
@@ -1319,27 +1305,19 @@ class FunkyCompatUtil
   public function groundSurfaceInset(pngRel:String, rect:Dynamic):Int
   {
     if (rect == null) return 0;
-    var img:Dynamic = decodePngAlpha(pngRel);
-    if (img == null) return 0;
-    var W:Int = img.w;
-    var alpha:Bytes = img.alpha;
+    var px:Dynamic = openPngPixels(pngRel);
+    if (px == null) return 0;
     var rx:Int = fieldInt(rect, 'x');
     var ry:Int = fieldInt(rect, 'y');
     var rw:Int = fieldInt(rect, 'w');
     var rh:Int = fieldInt(rect, 'h');
     var fy:Int = fieldInt(rect, 'fy');
-    if (rw <= 0 || rh <= 0 || ry + rh > img.h) return 0;
+    if (rw <= 0 || rh <= 0 || ry + rh > px.h) return 0;
     var threshold:Int = Std.int(rw * 0.30);
     if (threshold < 1) threshold = 1;
     for (r in 0...rh)
     {
-      var cnt:Int = 0;
-      var base:Int = (ry + r) * W + rx;
-      for (x in 0...rw)
-      {
-        if (alpha.get(base + x) > 16) cnt++;
-      }
-      if (cnt >= threshold)
+      if (rowDenseCount(px, ry + r, rx, rw) >= threshold)
       {
         var boxRow:Int = r - fy;
         return boxRow < 0 ? 0 : boxRow;

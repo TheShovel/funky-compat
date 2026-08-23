@@ -1,0 +1,1094 @@
+// funky-compat - generic runtime-configurable stage.
+// ONE real scripted class, instantiated per converted Codename stage by
+// FunkyCompatModule at boot (in-memory; no files are written). Each instance
+// receives a `dyn` config object holding raw engine anchor data plus portable
+// FX extracted from the mod's stage scripts (shaders, overlays, beat bounces)
+// and reproduces the original engine's positioning/behavior at play time.
+
+import funkin.play.stage.Stage;
+import funkin.Conductor;
+
+import funkin.play.character.BaseCharacter;
+import funkin.play.character.CharacterType;
+import funkin.Assets;
+import funkin.Paths;
+import funkin.util.ReflectUtil;
+import flixel.FlxG;
+import flixel.FlxSprite;
+import flixel.util.FlxColor;
+import flixel.tweens.FlxTween;
+import flixel.tweens.FlxEase;
+import flixel.addons.display.FlxRuntimeShader;
+import openfl.display.BlendMode;
+import openfl.display.BitmapData;
+import openfl.geom.Rectangle;
+import openfl.geom.Matrix;
+import openfl.utils.ByteArray;
+import haxe.io.Bytes;
+
+class FunkyCompatDynStage extends Stage
+{
+  public var dyn:Dynamic;
+
+  // 3D model rendering (Codename Flx3DView approximation)
+  var modelFlx:FlxSprite = null;
+  var modelFocal:Float = 0;
+  var modelBaseZ:Float = 1150;
+
+  // Shader instances created for script-derived overlays. Codename stage
+  // scripts commonly animate these from update(), e.g. fog.iTime = time.
+  var runtimeShaders:Array<FlxRuntimeShader> = [];
+  var shaderTime:Float = 0;
+  var soloFlash:FlxSprite = null;
+  var soloSprites:Array<FlxSprite> = [];
+  var lastSoloStep:Int = -1;
+  var callCursor:Int = 0;
+  var codenameBeatMode:Int = 0;
+  var lastCompatBeat:Int = -1;
+  var scriptSprites:Array<FlxSprite> = [];
+  var extractedBeat:Int = -1;
+  var extractedBeatCount:Int = 0;
+  var dynamicPropBases:Dynamic = {};
+
+  public function new(id:String)
+  {
+    super(id);
+  }
+
+  // Build script-derived overlay sprites once the JSON props exist.
+  override function onCreate(event:ScriptEvent):Void
+  {
+    super.onCreate(event);
+    callCursor = 0;
+    codenameBeatMode = 0;
+    scriptSprites = [];
+    extractedBeat = -1;
+    extractedBeatCount = 0;
+    dynamicPropBases = {};
+    lastCompatBeat = -1;
+    if (dyn == null || dyn.overlays == null) return;
+    for (o in 0...dyn.overlays.length)
+    {
+      var ov:Dynamic = dyn.overlays[o];
+      if (ov == null) continue;
+      var shSpec:Dynamic = get(ov, 'shader');
+      trace('[FUNKY-COMPAT] DynStage overlay ' + o + ': pos=(' + util_f(get(ov, 'x'), 0) + ',' + util_f(get(ov, 'y'), 0) + ') size=(' + util_f(get(ov, 'w'), 1) + 'x' + util_f(get(ov, 'h'), 1) + ') col=' + Std.string(get(ov, 'color')) + ' scale=(' + util_f(get(ov, 'scaleX'), 1) + ',' + util_f(get(ov, 'scaleY'), 1) + ') scroll=(' + util_f(get(ov, 'scrollX'), 0) + ',' + util_f(get(ov, 'scrollY'), 0) + ') ang=' + util_f(get(ov, 'angle'), 0) + ' blend=' + Std.string(get(ov, 'blend')) + ' z=' + util_f(get(ov, 'z'), 5000) + ' shader=' + (shSpec == null ? 'none' : Std.string(get(shSpec, 'frag'))));
+      var spr:FlxSprite = new FlxSprite(util_f(get(ov, 'x'), 0), util_f(get(ov, 'y'), 0));
+      var imgRaw:Dynamic = get(ov, 'image');
+      var img:String = imgRaw == null ? '' : Std.string(imgRaw);
+      if (img != '')
+      {
+        spr.loadGraphic(Paths.image(img));
+      }
+      else
+      {
+        var col:Dynamic = get(ov, 'color');
+        var colInt:Null<Int> = col == null ? 0xFF000000 : Std.parseInt(Std.string(col));
+        // Sentinels from extraction: -1 = screen width, -2 = screen height.
+        var wRaw:Float = util_f(get(ov, 'w'), 1);
+        var hRaw:Float = util_f(get(ov, 'h'), 1);
+        var wInt:Int = wRaw <= -1.5 ? FlxG.height : (wRaw <= -0.5 ? FlxG.width : Std.int(wRaw));
+        var hInt:Int = hRaw <= -1.5 ? FlxG.height : (hRaw <= -0.5 ? FlxG.width : Std.int(hRaw));
+        if (wInt < 1) wInt = 1;
+        if (hInt < 1) hInt = 1;
+        // Shader-overlay sprites (like GUNLICK's fog) need OPAQUE pixels:
+        // their fragment shaders sample texture alpha to gate visibility,
+        // and a truly transparent bitmap yields alpha=0 (invisible) or
+        // platform-dependent garbage. White fill = alpha 1 everywhere.
+        var isShaderOverlay:Bool = get(ov, 'shader') != null;
+        if (isShaderOverlay && colInt == 0) colInt = 0xFFFFFFFF;
+        spr.makeGraphic(wInt, hInt, colInt == null ? 0xFF000000 : colInt);
+        trace('[FUNKY-COMPAT-3D] makeGraphic(' + wInt + ',' + hInt + ',' + colInt + ') -> w=' + spr.width + ' h=' + spr.height + ' frames=' + (spr.frames != null ? spr.frames.numFrames : 'null') + ' pixels=' + (spr.pixels != null ? Std.int(spr.pixels.width) + 'x' + Std.int(spr.pixels.height) : 'null'));
+      }
+      var sx:Float = util_f(get(ov, 'scaleX'), 1);
+      var sy:Float = util_f(get(ov, 'scaleY'), 1);
+      if (sx != 1 || sy != 1)
+      {
+        spr.scale.set(sx, sy);
+        spr.updateHitbox();
+      }
+      spr.scrollFactor.set(util_f(get(ov, 'scrollX'), 0), util_f(get(ov, 'scrollY'), 0));
+      spr.angle = util_f(get(ov, 'angle'), 0);
+      // Rotate around the CENTER, not flixel's default top-left origin -
+      // otherwise large rotated overlays (fog @180°) swing mostly
+      // off-screen leaving only a corner visible.
+      if (spr.angle != 0)
+      {
+        spr.origin.set(spr.width / 2, spr.height / 2);
+      }
+      spr.alpha = util_f(get(ov, 'alpha'), 1);
+      var blendRaw:Dynamic = get(ov, 'blend');
+      var blend:String = blendRaw == null ? '' : Std.string(blendRaw);
+      if (blend != '') spr.blend = BlendMode.fromString(blend);
+      var sh:FlxRuntimeShader = makeShader(get(ov, 'shader'));
+      if (sh != null)
+      {
+        spr.shader = sh;
+        runtimeShaders.push(sh);
+      }
+      spr.zIndex = Std.int(util_f(get(ov, 'z'), 5000));
+      this.add(spr);
+      trace('[FUNKY-COMPAT-3D] overlay "' + Std.string(get(ov, 'shader') != null ? get(get(ov, 'shader'), 'frag') : 'none') + '" final: x=' + Math.round(spr.x) + ' y=' + Math.round(spr.y) + ' w=' + Math.round(spr.width) + ' h=' + Math.round(spr.height) + ' scale=' + Math.round(spr.scale.x * 100) / 100 + 'x' + Math.round(spr.scale.y * 100) / 100 + ' angle=' + spr.angle + ' origin=(' + Math.round(spr.origin.x) + ',' + Math.round(spr.origin.y) + ') visible=' + spr.visible);
+    }
+
+    // Recreate sprites constructed by Codename stage scripts. Their count,
+    // atlas, frame/prefix, transform, and insertion target are extracted from
+    // the script rather than inferred from any particular mod.
+    if (dyn.scriptSprites != null)
+    {
+      var modeList:Dynamic = get(dyn, 'beatModes');
+      trace('[FUNKY-COMPAT] extracted beat modes=' + (modeList == null ? 'null' : modeList.length));
+      for (spec in dyn.scriptSprites)
+      {
+        if (spec == null) continue;
+        var count:Int = Std.int(util_f(get(spec, 'count'), 1));
+        if (count < 1) count = 1;
+        for (si in 0...count)
+        {
+          var px:Float = util_f(get(spec, 'x'), 0) + util_f(get(spec, 'stepX'), 0) * si;
+          var py:Float = util_f(get(spec, 'y'), 0) + util_f(get(spec, 'stepY'), 0) * si;
+          var spr:FlxSprite = new FlxSprite(px, py);
+          var atlas:String = Std.string(get(spec, 'atlas'));
+          if (atlas != null && atlas != '' && atlas != 'null')
+          {
+            spr.frames = Paths.getSparrowAtlas(atlas);
+            var animName:String = Std.string(get(spec, 'anim'));
+            var prefix:String = Std.string(get(spec, 'prefix'));
+            var frame:Int = Std.int(util_f(get(spec, 'frame'), -1));
+            var resolvedAnim:String = animName == '' || animName == 'null' ? 'idle' : animName;
+            if (get(spec, 'randomFrames') == true && prefix != '' && prefix != 'null')
+            {
+              var randomMin:Int = Std.int(util_f(get(spec, 'randomMin'), 0));
+              var randomMax:Int = Std.int(util_f(get(spec, 'randomMax'), randomMin));
+              var randomRange:Int = randomMax - randomMin + 1;
+              if (randomRange < 1) randomRange = 1;
+              var randomOffset:Int = Std.int(util_f(get(spec, 'randomOffset'), 0));
+              var randomValue:Int = randomMin + (si % randomRange) + randomOffset;
+              spr.animation.addByPrefix(resolvedAnim, prefix + randomValue, 0, false);
+            }
+            else if (frame >= 0) spr.animation.add(resolvedAnim, [frame], 0, false);
+            else if (prefix != '' && prefix != 'null') spr.animation.addByPrefix(resolvedAnim, prefix, util_f(get(spec, 'fps'), 24), false);
+            if (spr.animation.getByName(animName == '' || animName == 'null' ? 'idle' : animName) != null) spr.animation.play(animName == '' || animName == 'null' ? 'idle' : animName);
+          }
+          spr.antialiasing = util_b(get(spec, 'antialiasing'), true);
+          spr.scale.set(util_f(get(spec, 'scaleX'), 1), util_f(get(spec, 'scaleY'), 1));
+          spr.updateHitbox();
+          var before:String = Std.string(get(spec, 'before'));
+          var beforeProp:Dynamic = before == null || before == 'null' || before == '' ? null : getNamedProp(before);
+          spr.zIndex = beforeProp != null ? Std.int(beforeProp.zIndex) - 1 : Std.int(util_f(get(spec, 'z'), 150));
+          scriptSprites.push(spr);
+          this.add(spr);
+        }
+      }
+      this.refresh();
+      trace('[FUNKY-COMPAT] Recreated script-created sprites: ' + scriptSprites.length);
+    }
+
+    // Parallax scroll-factor overrides on named props (3D-mode depth feel).
+    if (dyn.scrolls != null)
+    {
+      for (si in 0...dyn.scrolls.length)
+      {
+        var sc:Dynamic = dyn.scrolls[si];
+        if (sc == null) continue;
+        var tgt:String = Std.string(get(sc, 'target'));
+        if (tgt == 'bf' || tgt == 'dad' || tgt == 'gf') continue; // chars handled in addCharacter
+        var prop = getNamedProp(tgt);
+        if (prop != null) prop.scrollFactor.set(util_f(get(sc, 'x'), 1), util_f(get(sc, 'y'), 1));
+      }
+    }
+
+    // Hide props the script hides (e.g. bg under 3D mode).
+    if (dyn.hideProps != null)
+    {
+      for (hi in 0...dyn.hideProps.length)
+      {
+        var hp:String = Std.string(dyn.hideProps[hi]);
+        if (hp == 'bg' && get(dyn, 'model3d') != null) continue; // repositioned, not hidden
+        var hprop = getNamedProp(hp);
+        if (hprop != null)
+        {
+          hprop.visible = false;
+          trace('[FUNKY-COMPAT-3D] hid prop "$hp"');
+        }
+        else trace('[FUNKY-COMPAT-3D] hide target "$hp" not found');
+      }
+    }
+
+    // Prefer the parsed 3D model. The flat prerender is only a fallback for
+    // platforms or assets where the model cannot be rasterized.
+    var m3:Dynamic = get(dyn, 'model3d');
+    if (m3 != null)
+    {
+      buildModel(m3);
+      var modelBackdrop:Dynamic = getNamedProp('bg');
+      if (modelFlx != null && modelBackdrop != null)
+      {
+        modelBackdrop.visible = false;
+        trace('[FUNKY-COMPAT-3D] using rasterized model; hid prerender fallback');
+      }
+    }
+
+    // If model rendering is unavailable, use the projected model bounds to
+    // position the flat prerender as a compatibility fallback.
+    if (m3 != null && modelFlx != null)
+    {
+      var b:Dynamic = modelScreenBounds(m3);
+      if (b != null)
+      {
+        var bgProp = getNamedProp('bg');
+        if (bgProp != null && bgProp.pixels != null)
+        {
+          var bw:Float = util_f(get(b, 'maxX'), 0) - util_f(get(b, 'minX'), 0);
+          var bh:Float = util_f(get(b, 'maxY'), 0) - util_f(get(b, 'minY'), 0);
+          if (bw > 8 && bh > 8)
+          {
+            var minX:Float = util_f(get(b, 'minX'), 0);
+            var minY:Float = util_f(get(b, 'minY'), 0);
+            // Expand the tiny projected rect around its center to fill the
+            // view (the model's world units are arbitrary; the SHAPE and
+            // center are what matter).
+            var cx:Float = (minX + util_f(get(b, 'maxX'), 0)) / 2;
+            // Ground line: config override, else bottom of screen.
+            var groundY:Float = util_f(get(dyn, 'fake3dY'), FlxG.height);
+            // Zoom: expand factor over plain cover-fit (config, default 2).
+            var F:Float = Math.max(FlxG.width * 0.9 / Math.max(bw, 1), FlxG.height * 0.9 / Math.max(bh, 1));
+            F *= util_f(get(dyn, 'fake3dZoom'), 2.0);
+            trace('[FUNKY-COMPAT-3D] config: groundY=' + groundY + ' zoom=' + util_f(get(dyn, 'fake3dZoom'), 2.0));
+            bw *= F;
+            bh *= F;
+            // Bottom-anchor at the ground line: grow UPWARD from there so
+            // the floor stays put and the room rises above it.
+            minX = cx - bw / 2;
+            minY = groundY - bh;
+            bgProp.x = minX + FlxG.camera.scroll.x * bgProp.scrollFactor.x;
+            bgProp.y = minY + FlxG.camera.scroll.y * bgProp.scrollFactor.y;
+            var zInv:Float = FlxG.camera.zoom > 0.01 ? 1 / FlxG.camera.zoom : 1;
+            bgProp.scale.x = bw / bgProp.pixels.width * zInv;
+            bgProp.scale.y = bh / bgProp.pixels.height * zInv;
+            bgProp.updateHitbox();
+            // Diagnostics: final rect + opaque-content bbox of the art.
+            var opMinX:Int = -1; var opMaxX:Int = -1; var opMinY:Int = -1; var opMaxY:Int = -1;
+            var pw2:Int = Std.int(bgProp.pixels.width);
+            var ph2:Int = Std.int(bgProp.pixels.height);
+            var stepY2:Int = Std.int(Math.max(1, ph2 / 64));
+            var stepX2:Int = Std.int(Math.max(1, pw2 / 64));
+            var py:Int = 0;
+            while (py < ph2)
+            {
+              var px:Int = 0;
+              while (px < pw2)
+              {
+                if ((bgProp.pixels.getPixel32(px, py) >>> 24) > 0)
+                {
+                  if (opMinX < 0 || px < opMinX) opMinX = px;
+                  if (px > opMaxX) opMaxX = px;
+                  if (opMinY < 0 || py < opMinY) opMinY = py;
+                  if (py > opMaxY) opMaxY = py;
+                }
+                px += stepX2;
+              }
+              py += stepY2;
+            }
+            trace('[FUNKY-COMPAT-3D] placed: pos=(' + Math.round(bgProp.x) + ',' + Math.round(bgProp.y) + ') scale=' + Math.round(bgProp.scale.x * 100) / 100 + ' onscreen=' + Math.round(bw) + 'x' + Math.round(bh) + ' zoom=' + Math.round(FlxG.camera.zoom * 100) / 100 + ' artOpaqueBox=[' + opMinX + '..' + opMaxX + ',' + opMinY + '..' + opMaxY + '] of ' + pw2 + 'x' + ph2);
+            // Do NOT hide bg - it IS the backdrop, now correctly placed.
+            trace('[FUNKY-COMPAT-3D] prerender placed at (' + Math.round(util_f(get(b, 'minX'), 0)) + ',' + Math.round(util_f(get(b, 'minY'), 0)) + ') size ' + Math.round(bw) + 'x' + Math.round(bh));
+          }
+        }
+      }
+    }
+  }
+
+  // Project every model vertex with GUNLICK's base camera and return the
+  // screen-space bounding box: {minX,maxX,minY,maxY}.
+  function modelScreenBounds(m3:Dynamic):Dynamic
+  {
+    try
+    {
+      var meshes:Array<Dynamic> = get(m3, 'meshes');
+      if (meshes == null || meshes.length == 0) return null;
+      var W:Float = FlxG.width;
+      var H:Float = FlxG.height;
+      var focal:Float = (H * 1.15 / 2) / Math.tan(70 * Math.PI / 360);
+      var camX:Float = 200;
+      var camY:Float = -50;
+      var camZ:Float = -1150;
+      var minX:Float = 99999; var maxX:Float = -99999; var minY:Float = 99999; var maxY:Float = -99999;
+      var any:Bool = false;
+      for (mi in 0...meshes.length)
+      {
+        var mesh:Dynamic = meshes[mi];
+        if (mesh == null) continue;
+        var verts:Array<Float> = get(mesh, 'verts');
+        var mtx:Array<Float> = get(mesh, 'matrix');
+        if (verts == null || mtx == null || verts.length < 3) continue;
+        for (vi in 0...Std.int(verts.length / 3))
+        {
+          var vx:Float = verts[vi * 3];
+          var vy:Float = verts[vi * 3 + 1];
+          var vz:Float = verts[vi * 3 + 2];
+          var wx:Float = vx * mtx[0] + vy * mtx[3] + vz * mtx[6] + mtx[9];
+          var wy:Float = vx * mtx[1] + vy * mtx[4] + vz * mtx[7] + mtx[10];
+          var wz:Float = vx * mtx[2] + vy * mtx[5] + vz * mtx[8] + mtx[11];
+          var dz:Float = wz - camZ;
+          if (dz < 1) dz = 1;
+          var sxi:Float = (wx - camX) * focal / dz + W / 2;
+          var syi:Float = -(wy - camY) * focal / dz + H / 2;
+          any = true;
+          if (sxi < minX) minX = sxi;
+          if (sxi > maxX) maxX = sxi;
+          if (syi < minY) minY = syi;
+          if (syi > maxY) maxY = syi;
+        }
+      }
+      if (!any || maxX <= minX || maxY <= minY) return null;
+      return {minX: minX, maxX: maxX, minY: minY, maxY: maxY};
+    }
+    catch (e:Dynamic)
+    {
+      trace('[FUNKY-COMPAT-3D] modelBounds failed: $e');
+      return null;
+    }
+  }
+
+  var fakeSpr:FlxSprite = null;
+  var fakeShader:FlxRuntimeShader = null;
+
+  function buildFake3D(m3:Dynamic):Void
+  {
+    try
+    {
+      if (fakeSpr != null)
+      {
+        remove(fakeSpr);
+        fakeSpr = null;
+      }
+      var bgProp = getNamedProp('bg');
+      if (bgProp == null || bgProp.pixels == null)
+      {
+        trace('[FUNKY-COMPAT-3D] fake3d: no bg prop to project');
+        return;
+      }
+      var W:Int = Std.int(FlxG.width);
+      var H:Int = Std.int(FlxG.height);
+      // 1.5x overscan: camera zoom-out must never reveal quad edges.
+      var QW:Int = Std.int(W * 1.5);
+      var QH:Int = Std.int(H * 1.5);
+      var fs:FlxSprite = new FlxSprite();
+      fs.makeGraphic(QW, QH, 0, true);
+      // Stretch the prerender across the fullscreen quad; the shader does
+      // the perspective sampling.
+      // Aspect-preserving bake, anchored so the image's bottom edge sits
+      // at the configured ground line (default: 85% down the screen).
+      // Override per-layer via config.json: "fake3dGroundY": <pixels>.
+      var mtx:openfl.geom.Matrix = new openfl.geom.Matrix();
+      var cov:Float = Math.max(W / bgProp.pixels.width, H / bgProp.pixels.height);
+      // Zoom into the art: the painted floor sits near the canvas bottom,
+      // well below what a plain cover-fit reveals. Default 2x.
+      cov *= util_f(get(dyn, 'fake3dZoom'), 2.0);
+      mtx.scale(cov, cov);
+      var groundY:Float = H;
+      var cfgY:Float = util_f(get(dyn, 'fake3dY'), 0);
+      if (cfgY > 0) groundY = cfgY;
+      trace('[FUNKY-COMPAT-3D] fake3d ground line at screen y=' + Math.round(groundY));
+      // Convert the screen-space anchor into QUAD-LOCAL coordinates
+      // (the quad is larger than the screen and negatively offset).
+      var fsY:Int = Std.int((H - QH) / 2);
+      var groundQuadY:Float = groundY - fsY;
+      mtx.translate((QW - bgProp.pixels.width * cov) / 2, groundQuadY - bgProp.pixels.height * cov);
+      // Draw into a SEPARATE bitmap and assign via the pixels SETTER -
+      // mutating .pixels in place leaves flixel's cached frame blank.
+      var snap:BitmapData = new BitmapData(QW, QH, true, 0);
+      snap.draw(bgProp.pixels, mtx);
+      fs.pixels = snap;
+      // Verify bake content.
+      var op:Int = 0;
+      for (chk in 0...32)
+      {
+        if ((fs.pixels.getPixel32(Std.int(W / 2), Std.int(chk * H / 32)) >>> 24) > 0) op++;
+      }
+      trace('[FUNKY-COMPAT-3D] fake3d bake center-column opaque=' + op + '/32');
+      fs.updateHitbox();
+
+      fakeShader = new FlxRuntimeShader(Assets.getText(Paths.frag('fake3d')));
+      // Focal based on the QUAD height so per-pixel density matches the
+      // old screen-sized framing; the extra margin is pure bleed.
+      var focal:Float = (QH / 2) / Math.tan(70 * Math.PI / 360);
+      fakeShader.setFloat('uFocal', focal);
+      // Wall extent visible through the quad at the base camera (z=-1150).
+      var wallW:Float = QW * modelBaseZ / focal;
+      var wallH:Float = QH * modelBaseZ / focal;
+      fakeShader.setFloatArray('uWall', [wallW, wallH]);
+      // At the base camera the full texture fills the view exactly.
+      fakeShader.setFloatArray('uBase', [200, -50]);
+      fs.shader = fakeShader;
+      fs.scrollFactor.set(0, 0);
+      fs.zIndex = -1000;
+      fs.x = (W - QW) / 2;
+      fs.y = (H - QH) / 2;
+      fakeSpr = fs;
+      this.add(fs);
+      this.refresh();
+      updateFake3D();
+      trace('[FUNKY-COMPAT-3D] fake3d wall built');
+    }
+    catch (e:Dynamic)
+    {
+      trace('[FUNKY-COMPAT-3D] buildFake3D failed: $e');
+      fakeSpr = null;
+    }
+  }
+
+  // Per-frame camera coupling matching GUNLICK's numbers.
+  function updateFake3D():Void
+  {
+    if (fakeShader == null || FlxG.camera == null) return;
+    var cx:Float = FlxG.camera.scroll.x / 3.2 + 200;
+    // Vertical parallax rate tuned to MATCH the characters' scrollFactor
+    // (0.5): focal/(1150*div) = 0.5 keeps feet glued to the ground line.
+    var cy:Float = -FlxG.camera.scroll.y / 1.03 - 50;
+    var cz:Float = -modelBaseZ + FlxG.camera.zoom * 10;
+    fakeShader.setFloat('uCamX', cx);
+    fakeShader.setFloat('uCamY', cy);
+    fakeShader.setFloat('uCamZ', cz);
+  }
+
+  // Project all meshes once with GUNLICK's base camera (200,-50,-1150,
+  // fov 70) and draw them into an openfl Sprite via GPU drawTriangles.
+  // Per-frame camera translation is applied by offsetting the sprite.
+  function buildModel(m3:Dynamic):Void
+  {
+    try
+    {
+      // Re-entry guard: PlayState re-runs onCreate per song.
+      if (modelFlx != null)
+      {
+        remove(modelFlx);
+        modelFlx = null;
+      }
+      var meshes:Array<Dynamic> = get(m3, 'meshes');
+      if (meshes == null || meshes.length == 0) return;
+      var texPixels:Array<Int> = get(m3, 'texPixels');
+      var tw:Int = Std.int(util_f(get(m3, 'texW'), 512));
+      var th:Int = Std.int(util_f(get(m3, 'texH'), 512));
+      if (texPixels == null || texPixels.length == 0)
+      {
+        trace('[FUNKY-COMPAT-3D] no texture pixels - aborting model');
+        return;
+      }
+      var W:Float = FlxG.width;
+      var H:Float = FlxG.height;
+      // Render at 1/3 resolution and upscale - 9x fewer interpreted pixel
+      // ops, visually acceptable for a background.
+      // GUNLICK creates its Flx3DView at 1.15x screen size; project
+      // against that viewport for faithful framing.
+      var VW:Float = W * 1.15;
+      var VH:Float = H * 1.15;
+      // HScript software rasterization is expensive. Render the model at a
+      // bounded low resolution and upscale it as a background; this keeps
+      // real geometry/depth while avoiding millions of interpreted pixel ops.
+      var RW:Int = Std.int(VW / 6);
+      var RH:Int = Std.int(VH / 6);
+      modelFocal = (VH / 2) / Math.tan(70 * Math.PI / 360);
+      var camX:Float = 200;
+      var camY:Float = -50;
+      var camZ:Float = -modelBaseZ;
+      var modelTransform:Dynamic = get(dyn, 'modelTransform');
+      var modelScale:Float = util_f(get(modelTransform, 'scale'), 1);
+      var modelX:Float = util_f(get(modelTransform, 'x'), 0);
+      var modelY:Float = util_f(get(modelTransform, 'y'), 0);
+      var modelZ:Float = util_f(get(modelTransform, 'z'), 0);
+      var modelRotationY:Float = util_f(get(modelTransform, 'rotationY'), 0) * Math.PI / 180;
+      var cosY:Float = Math.cos(modelRotationY);
+      var sinY:Float = Math.sin(modelRotationY);
+
+      var ob:Bytes = Bytes.alloc(RW * RH * 4);
+      var depthBuffer:Array<Float> = [];
+      for (di in 0...(RW * RH)) depthBuffer.push(999999999);
+      // Direct ARGB output; BitmapData.setPixels byte order is ambiguous
+      // across targets, so pixels are written with setPixel32 instead.
+      var outPixels:Array<Int> = [];
+      for (di in 0...(RW * RH)) outPixels.push(0);
+
+      for (mi in 0...meshes.length)
+      {
+        var mesh:Dynamic = meshes[mi];
+        if (mesh == null) continue;
+        var verts:Array<Float> = get(mesh, 'verts');
+        var uvs:Array<Float> = get(mesh, 'uvs');
+        var indices:Array<Int> = get(mesh, 'indices');
+        var mtx:Array<Float> = get(mesh, 'matrix');
+        if (verts == null || verts.length < 3) continue;
+        var nv:Int = Std.int(verts.length / 3);
+        var validIndexCount:Int = 0;
+        if (indices != null)
+        {
+          for (candidateIndex in indices)
+            if (candidateIndex >= 0 && candidateIndex < nv) validIndexCount++;
+        }
+        if (indices == null || indices.length < 3 || validIndexCount < 3 || validIndexCount < Std.int(indices.length * 0.5))
+        {
+          // Some AWD exporters omit or encode an index stream that does not
+          // match the vertex stream. Recover sequential triangle topology
+          // instead of silently producing an empty model.
+          indices = [];
+          for (fallbackIndex in 0...nv) indices.push(fallbackIndex);
+        }
+        trace('[FUNKY-COMPAT-3D] mesh "' + Std.string(get(mesh, 'name')) + '" verts=' + nv + ' indices=' + indices.length + ' valid=' + validIndexCount + ' uvs=' + (uvs == null ? 0 : uvs.length));
+        var px2:Array<Float> = [];
+        var py2:Array<Float> = [];
+        var pu:Array<Float> = [];
+        var pv:Array<Float> = [];
+        var pz2:Array<Float> = [];
+        var minX:Float = 99999; var maxX:Float = -99999; var minY:Float = 99999; var maxY:Float = -99999;
+        for (vi in 0...nv)
+        {
+          var vx:Float = verts[vi * 3];
+          var vy:Float = verts[vi * 3 + 1];
+          var vz:Float = verts[vi * 3 + 2];
+          var tx:Float = vx * mtx[0] + vy * mtx[3] + vz * mtx[6] + mtx[9];
+          var ty:Float = vx * mtx[1] + vy * mtx[4] + vz * mtx[7] + mtx[10];
+          var tz:Float = vx * mtx[2] + vy * mtx[5] + vz * mtx[8] + mtx[11];
+          tx *= modelScale; ty *= modelScale; tz *= modelScale;
+          var wx:Float = tx * cosY + tz * sinY + modelX;
+          var wy:Float = ty + modelY;
+          var wz:Float = -tx * sinY + tz * cosY + modelZ;
+          var dz:Float = wz - camZ;
+          if (dz < 1) dz = 1;
+          var pxi:Float = (wx - camX) * modelFocal / dz + VW / 2;
+          var pyi:Float = -(wy - camY) * modelFocal / dz + VH / 2;
+          px2.push(pxi);
+          py2.push(pyi);
+          pz2.push(dz);
+          if (pxi < minX) minX = pxi;
+          if (pxi > maxX) maxX = pxi;
+          if (pyi < minY) minY = pyi;
+          if (pyi > maxY) maxY = pyi;
+          if (uvs != null && vi * 2 + 1 < uvs.length)
+          {
+            pu.push(uvs[vi * 2]);
+            pv.push(uvs[vi * 2 + 1]);
+          }
+          else
+          {
+            pu.push(0);
+            pv.push(0);
+          }
+        }
+
+        // Scanline fill with INCREMENTAL barycentrics (no per-pixel mults).
+        var tris:Int = 0;
+        var filled:Int = 0;
+        for (ti in 0...Std.int(indices.length / 3))
+        {
+          var ia:Int = indices[ti * 3];
+          var ib:Int = indices[ti * 3 + 1];
+          var icc:Int = indices[ti * 3 + 2];
+          if (ia >= nv || ib >= nv || icc >= nv) continue;
+          var ax:Float = px2[ia]; var ay:Float = py2[ia];
+          var bx:Float = px2[ib]; var by:Float = py2[ib];
+          var cx:Float = px2[icc]; var cy:Float = py2[icc];
+          var area:Float = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+          if (area > -0.01 && area < 0.01) continue;
+          var inv:Float = 1 / area;
+          var x0:Int = Std.int(Math.max(0, Math.min(ax, Math.min(bx, cx))));
+          var x1:Int = Std.int(Math.min(RW - 1, Math.max(ax, Math.max(bx, cx))) + 1);
+          var y0:Int = Std.int(Math.max(0, Math.min(ay, Math.min(by, cy))));
+          var y1:Int = Std.int(Math.min(RH - 1, Math.max(ay, Math.max(by, cy))) + 1);
+          if (x1 <= x0 || y1 <= y0) continue;
+          tris++;
+          // Edge function values at (x0+0.5, y0+0.5).
+          var fx0:Float = x0 + 0.5;
+          var fy0:Float = y0 + 0.5;
+          var w0r:Float = ((bx - ax) * (fy0 - ay) - (by - ay) * (fx0 - ax)) * inv;
+          var w1r:Float = ((fx0 - ax) * (cy - ay) - (fy0 - ay) * (cx - ax)) * inv;
+          // Per-x-step deltas.
+          var w0dx:Float = -(by - ay) * inv;
+          var w1dx:Float = (cy - ay) * inv;
+          // Per-y-step deltas.
+          var w0dy:Float = (bx - ax) * inv;
+          var w1dy:Float = -(cx - ax) * inv;
+          var positive:Bool = area > 0;
+          for (yy in y0...(y1 + 1))
+          {
+            var w0:Float = w0r;
+            var w1:Float = w1r;
+            var rowBase:Int = yy * RW;
+            for (xx in x0...(x1 + 1))
+            {
+              var w2:Float = 1 - w0 - w1;
+              var inside:Bool = positive ? (w0 >= 0 && w1 >= 0 && w2 >= 0) : (w0 <= 0 && w1 <= 0 && w2 <= 0);
+              if (inside)
+              {
+                var pixelIndex:Int = rowBase + xx;
+                var depth:Float = pz2[ia] * w0 + pz2[ib] * w1 + pz2[icc] * w2;
+                if (depth >= depthBuffer[pixelIndex])
+                {
+                  w0 += w0dx;
+                  w1 += w1dx;
+                  continue;
+                }
+                depthBuffer[pixelIndex] = depth;
+                var uu:Float = pu[ia] * w0 + pu[ib] * w1 + pu[icc] * w2;
+                var vv:Float = pv[ia] * w0 + pv[ib] * w1 + pv[icc] * w2;
+                var txI:Int = Std.int(uu * tw);
+                var tyI:Int = Std.int(vv * th);
+                if (txI < 0) txI = 0;
+                if (tyI < 0) tyI = 0;
+                if (txI >= tw) txI = tw - 1;
+                if (tyI >= th) tyI = th - 1;
+                var argb:Int = texPixels[tyI * tw + txI];
+                outPixels[pixelIndex] = argb;
+                filled++;
+              }
+              w0 += w0dx;
+              w1 += w1dx;
+            }
+            w0r += w0dy;
+            w1r += w1dy;
+          }
+        }
+        trace('[FUNKY-COMPAT-3D]   rasterized "' + Std.string(get(mesh, 'name')) + '" tris=' + tris + ' filled=' + filled + 'px @' + RW + 'x' + RH);
+      }
+
+      var snap:BitmapData = new BitmapData(RW, RH, true, 0);
+      var snapY:Int = 0;
+      while (snapY < RH)
+      {
+        var snapX:Int = 0;
+        while (snapX < RW)
+        {
+          var snapArgb:Int = outPixels[snapY * RW + snapX];
+          if (snapArgb != 0) snap.setPixel32(snapX, snapY, snapArgb);
+          snapX++;
+        }
+        snapY++;
+      }
+
+      modelFlx = new FlxSprite();
+      modelFlx.makeGraphic(RW, RH, 0, true);
+      modelFlx.pixels = snap;
+      var modelOpaque:Int = 0;
+      for (samplePixel in 0...(RW * RH))
+      {
+        if ((snap.getPixel32(samplePixel % RW, Std.int(samplePixel / RW)) >>> 24) > 0) modelOpaque++;
+      }
+      trace('[FUNKY-COMPAT-3D] model bitmap alpha coverage=' + modelOpaque + '/' + (RW * RH));
+      modelFlx.visible = true;
+      modelFlx.alpha = 1;
+      modelFlx.updateHitbox();
+      modelFlx.scale.set(VW / RW, VH / RH);
+      modelFlx.x = (W - VW) / 2;
+      modelFlx.y = (H - VH) / 2;
+      modelFlx.antialiasing = false;
+      modelFlx.scrollFactor.set(0, 0);
+      // Keep the model above the opaque 3D backing overlay (-1000), while
+      // remaining behind ordinary stage props and characters.
+      modelFlx.zIndex = 0;
+      this.add(modelFlx);
+      this.refresh();
+      trace('[FUNKY-COMPAT-3D] model view built (' + meshes.length + ' mesh(es))');
+    }
+    catch (e:Dynamic)
+    {
+      trace('[FUNKY-COMPAT-3D] buildModel failed: $e');
+      modelFlx = null;
+    }
+  }
+
+  override function onUpdate(event:UpdateScriptEvent):Void
+  {
+    super.onUpdate(event);
+    shaderTime += event.elapsed;
+    var conductorStep:Int = Std.int(Conductor.instance.currentStep);
+    // Process chart callbacks before the beat pass. A callback can change the
+    // state used by the very next beat, and must be visible immediately rather
+    // than one beat later.
+    replayCodenameCalls(conductorStep);
+    applyDynamicPropTransforms();
+    // Use the step clock as a fallback as well as the beat callback.
+    // callbacks are not guaranteed to be delivered by every V-Slice build.
+    var beat:Int = Std.int(conductorStep / 4);
+    if (beat != extractedBeat)
+    {
+      extractedBeat = beat;
+      applyExtractedBeat();
+    }
+    relaxExtractedBeat(event.elapsed);
+
+    if (conductorStep != lastSoloStep)
+    {
+      lastSoloStep = conductorStep;
+      runStepFx(conductorStep);
+    }
+    for (sh in runtimeShaders)
+    {
+      // Unknown uniforms are ignored by FlxRuntimeShader; iTime is the
+      // convention used by GUNLICK's fog shader and its update() function.
+      sh.setFloat('iTime', shaderTime);
+    }
+    if (fakeSpr != null)
+    {
+      updateFake3D();
+      return;
+    }
+    if (modelFlx == null || FlxG.camera == null) return;
+    // GUNLICK maps camera scroll -> 3D camera x/y. With a fixed-projection
+    // bake, translation becomes a screen-space offset.
+    var dx:Float = FlxG.camera.scroll.x / 3.2;
+    var dy:Float = -FlxG.camera.scroll.y / 3.5;
+    modelFlx.x = -dx * modelFocal / modelBaseZ;
+    modelFlx.y = dy * modelFocal / modelBaseZ;
+  }
+
+  // The JSON stage data (built by placeAnchor) already positions characters
+  // exactly - super.addCharacter handles placement. This override only adds
+  // the script-derived color grading; do NOT reposition here (re-deriving
+  // from raw anchors double-converts and throws characters off-stage).
+  override function addCharacter(character:BaseCharacter, charType:CharacterType):Void
+  {
+    super.addCharacter(character, charType);
+    if (dyn == null) return;
+    var a:Dynamic = null;
+    if (charType == CharacterType.BF) a = get(dyn, 'bf');
+    else if (charType == CharacterType.DAD) a = get(dyn, 'dad');
+    else if (charType == CharacterType.GF) a = get(dyn, 'gf');
+    if (a == null) return;
+
+    var sh:FlxRuntimeShader = makeShader(get(a, 'shader'));
+    if (sh != null) character.shader = sh;
+
+    // Parallax override for this slot (apply3DScrollFactors-style).
+    if (dyn.scrolls != null)
+    {
+      var slot:String = charType == CharacterType.BF ? 'bf' : (charType == CharacterType.DAD ? 'dad' : 'gf');
+      for (si in 0...dyn.scrolls.length)
+      {
+        var sc:Dynamic = dyn.scrolls[si];
+        if (sc != null && Std.string(get(sc, 'target')) == slot)
+        {
+          character.scrollFactor.set(util_f(get(sc, 'x'), 1), util_f(get(sc, 'y'), 1));
+        }
+      }
+    }
+  }
+
+  function applyDynamicPropTransforms():Void
+  {
+    if (dyn == null) return;
+    var dynamicProps:Array<Dynamic> = get(dyn, 'dynamicProps');
+    if (dynamicProps == null || FlxG.camera == null) return;
+    for (spec in dynamicProps)
+    {
+      if (spec == null || get(spec, 'cameraPerspective') != true) continue;
+      var target:Dynamic = getNamedProp(Std.string(get(spec, 'target')));
+      if (target == null || target.width <= 0 || target.height <= 0) continue;
+      var targetName:String = Std.string(get(spec, 'target'));
+      var base:Dynamic = get(dynamicPropBases, targetName);
+      if (base == null)
+      {
+        // Stage construction calls updateHitbox after applying the XML scale,
+        // while Codename's default XML path does not. Recover the logical
+        // unscaled frame dimensions and the authored position once, before
+        // the script changes scale.y.
+        var initialScaleX:Float = target.scale.x > 0.001 ? target.scale.x : 1;
+        var initialScaleY:Float = target.scale.y > 0.001 ? target.scale.y : 1;
+        var logicalW:Float = target.width / initialScaleX;
+        var logicalH:Float = target.height / initialScaleY;
+        base = {
+          w: logicalW,
+          h: logicalH,
+          x: target.x - logicalW * (1 - initialScaleX) / 2,
+          y: target.y - logicalH * (1 - initialScaleY) / 2
+        };
+        dynamicPropBases[targetName] = base;
+      }
+      var logicalW2:Float = util_f(get(base, 'w'), target.width);
+      var logicalH2:Float = util_f(get(base, 'h'), target.height);
+      var midX:Float = util_f(get(base, 'x'), target.x) + logicalW2 / 2;
+      var midY:Float = util_f(get(base, 'y'), target.y) + logicalH2 / 2;
+      var cameraCenterX:Float = FlxG.camera.scroll.x + FlxG.width / 2;
+      var cameraCenterY:Float = FlxG.camera.scroll.y + FlxG.height / 2;
+      // This is the camera-relative perspective transform used by Codename
+      // stage scripts. Keep the constants as part of the generic transform;
+      // the target prop is extracted from the source script.
+      var perspectiveScaleY:Float = ((-(cameraCenterY - midY - 200) / 0.002) / Math.PI / logicalH2) / (logicalH2 / 2.5);
+      if (Math.isNaN(perspectiveScaleY) || Math.isNaN(logicalW2) || Math.isNaN(logicalH2)) continue;
+      // A perspective script must never make a stage prop disappear because
+      // a camera midpoint briefly crosses its reference plane.
+      if (perspectiveScaleY < 0.05) perspectiveScaleY = 0.05;
+      if (perspectiveScaleY > 1.6) perspectiveScaleY = 1.6;
+      target.skew.x = (-(cameraCenterX - midX) / 0.001) / Math.PI / logicalW2;
+      target.scale.y = perspectiveScaleY;
+    }
+  }
+
+  function replayCodenameCalls(step:Int):Void
+  {
+    if (dyn == null) return;
+    var calls:Array<Dynamic> = get(dyn, 'callEvents');
+    if (calls == null) return;
+    while (callCursor < calls.length)
+    {
+      var call:Dynamic = calls[callCursor];
+      var callStep:Int = Std.int(util_f(get(call, 'step'), 0));
+      if (callStep > step) break;
+      callCursor++;
+      var fn:String = Std.string(get(call, 'fn'));
+      var args:Dynamic = get(call, 'args');
+      trace('[FUNKY-COMPAT] Codename HScript Call ' + fn + ' at step ' + callStep);
+      executeCallActions(fn);
+      // Keep callback arguments available to extracted actions. No callback
+      // name is interpreted as a mod-specific visual implementation here.
+      if (fn == 'beatSwitch' && args != null && args.length > 1)
+      {
+        codenameBeatMode = Std.int(util_f(args[1], 0));
+        // Codename scripts commonly reset their per-mode beat cursor when a
+        // state switch occurs. Keep the extracted state machine in sync and
+        // apply the new mode at the callback timestamp.
+        extractedBeatCount = 0;
+        applyExtractedBeat(false);
+      }
+    }
+  }
+
+  function executeCallActions(fn:String):Void
+  {
+    if (dyn == null) return;
+    var allActions:Dynamic = get(dyn, 'callActions');
+    if (allActions == null) return;
+    var actions:Array<Dynamic> = get(allActions, fn);
+    if (actions == null) return;
+    for (action in actions)
+    {
+      if (action == null) continue;
+      var targetName:String = Std.string(get(action, 'target'));
+      var target:Dynamic = getNamedProp(targetName);
+      var op:String = Std.string(get(action, 'op'));
+      if (target == null)
+      {
+        trace('[FUNKY-COMPAT] portable action target not found: ' + targetName);
+        continue;
+      }
+      if (op == 'visible') target.visible = get(action, 'value') == true;
+      else if (op == 'playAnim')
+      {
+        try { target.animation.play(Std.string(get(action, 'value')), true); } catch (e:Dynamic) {}
+      }
+    }
+  }
+
+
+  function selectedBeatMode():Dynamic
+  {
+    if (dyn == null || dyn.scriptSprites == null) return null;
+    var modes:Array<Dynamic> = get(dyn, 'beatModes');
+    if (modes == null || modes.length == 0) return null;
+    for (mode in modes)
+      if (mode != null && Std.int(util_f(get(mode, 'mode'), -1)) == codenameBeatMode) return mode;
+    return null;
+  }
+
+  function applyExtractedBeat(?advance:Bool = true):Void
+  {
+    var selected:Dynamic = selectedBeatMode();
+    if (selected == null)
+    {
+      trace('[FUNKY-COMPAT] beat state has no extracted mode ' + codenameBeatMode);
+      return;
+    }
+    trace('[FUNKY-COMPAT] apply beat mode=' + codenameBeatMode + ' cursor=' + extractedBeatCount + ' advance=' + advance + ' pattern=' + Std.string(get(selected, 'pattern')));
+    if (get(selected, 'pattern') == 'none' && codenameBeatMode == 4) return;
+    var baseX:Float = util_f(get(selected, 'baseX'), 1);
+    var baseY:Float = util_f(get(selected, 'baseY'), 1);
+    var basePosY:Float = util_f(get(selected, 'baseYPos'), Math.NaN);
+    var specialX:Float = util_f(get(selected, 'specialX'), baseX);
+    var specialY:Float = util_f(get(selected, 'specialY'), baseY);
+    var specialPosY:Float = util_f(get(selected, 'specialYPos'), basePosY);
+    var pattern:String = Std.string(get(selected, 'pattern'));
+    for (i in 0...scriptSprites.length)
+    {
+      var special:Bool = pattern == 'beatParity' ? (extractedBeatCount % 2 == 0) : (pattern == 'indexParity' ? (i % 2 == extractedBeatCount % 2) : (pattern == 'sequence' && i == extractedBeatCount));
+      var s:FlxSprite = scriptSprites[i];
+      s.scale.set(special ? specialX : baseX, special ? specialY : baseY);
+      if (!Math.isNaN(basePosY)) s.y = special && !Math.isNaN(specialPosY) ? specialPosY : basePosY;
+      s.updateHitbox();
+    }
+    if (advance) extractedBeatCount++;
+  }
+
+
+  // Smoothly return a beat pose toward the extracted mode's normal pose.
+  // This is deliberately based on imported pose data, not mod-specific names.
+  function relaxExtractedBeat(elapsed:Float):Void
+  {
+    var selected:Dynamic = selectedBeatMode();
+    if (selected == null || scriptSprites == null) return;
+    var baseX:Float = util_f(get(selected, 'baseX'), 1);
+    var baseY:Float = util_f(get(selected, 'baseY'), 1);
+    var basePosY:Float = util_f(get(selected, 'baseYPos'), Math.NaN);
+    var amount:Float = elapsed * 12;
+    if (amount > 1) amount = 1;
+    if (amount <= 0) return;
+    for (s in scriptSprites)
+    {
+      s.scale.x += (baseX - s.scale.x) * amount;
+      s.scale.y += (baseY - s.scale.y) * amount;
+      if (!Math.isNaN(basePosY)) s.y += (basePosY - s.y) * amount;
+      s.updateHitbox();
+    }
+  }
+
+  override function onStepHit(event:SongTimeScriptEvent):Void
+  {
+    super.onStepHit(event);
+    if (event.curStep != lastSoloStep)
+    {
+      lastSoloStep = event.curStep;
+      runStepFx(event.curStep);
+    }
+  }
+
+  function runStepFx(step:Int):Void
+  {
+    if (dyn == null) return;
+    var effects:Array<Dynamic> = get(dyn, 'stepFx');
+    if (effects == null) return;
+    for (fx in effects)
+    {
+      if (fx == null || Std.int(util_f(get(fx, 'step'), -1)) != step) continue;
+      var kind:String = Std.string(get(fx, 'kind'));
+      trace('[FUNKY-COMPAT] extracted step effect ' + kind + ' at step ' + step);
+      if (kind == 'flash')
+      {
+        soloFlash = new FlxSprite(0, 0);
+        soloFlash.makeGraphic(Std.int(FlxG.width * 2), Std.int(FlxG.height * 2), FlxColor.BLACK);
+        soloFlash.scrollFactor.set();
+        soloFlash.screenCenter();
+        soloFlash.zIndex = 6000;
+        this.add(soloFlash);
+      }
+      else if (kind == 'cinematic')
+      {
+        if (soloFlash != null) { this.remove(soloFlash); soloFlash = null; }
+        var cover:FlxSprite = new FlxSprite(0, 0);
+        cover.makeGraphic(Std.int(FlxG.width * 2), Std.int(FlxG.height * 2), FlxColor.BLACK);
+        cover.scrollFactor.set(); cover.screenCenter(); cover.alpha = 0.9; cover.zIndex = 6000;
+        soloSprites.push(cover); this.add(cover);
+        var images:Array<Dynamic> = get(fx, 'images');
+        var imageZ:Int = 6001;
+        if (images != null) for (imagePath in images)
+        {
+          var image:FlxSprite = new FlxSprite(0, 0);
+          image.loadGraphic(Paths.image(Std.string(imagePath)));
+          if (image.width > 0) { image.scale.set(FlxG.width / image.width, FlxG.height / image.height); image.updateHitbox(); }
+          image.screenCenter(); image.zIndex = imageZ++; soloSprites.push(image); this.add(image);
+        }
+        var top:FlxSprite = new FlxSprite(0, 0); top.makeGraphic(FlxG.width, Std.int(FlxG.height * 0.2), FlxColor.BLACK); top.zIndex = imageZ++; soloSprites.push(top); this.add(top);
+        var bottom:FlxSprite = new FlxSprite(0, Std.int(FlxG.height * 0.8)); bottom.makeGraphic(FlxG.width, Std.int(FlxG.height * 0.2), FlxColor.BLACK); bottom.zIndex = imageZ; soloSprites.push(bottom); this.add(bottom);
+      }
+      else if (kind == 'zoom')
+      {
+        if (FlxG.camera != null) FlxG.camera.zoom = util_f(get(fx, 'zoom'), 1.1);
+      }
+      else if (kind == 'fade')
+      {
+        for (s in soloSprites) if (s != null) FlxTween.tween(s, {alpha: 0.001}, 0.25, {ease: FlxEase.cubeOut});
+      }
+      this.refresh();
+    }
+  }
+
+  override function onBeatHit(event:SongTimeScriptEvent):Void
+  {
+    super.onBeatHit(event);
+    // Deduplicate against the update-loop fallback. If this callback is
+    // skipped, onUpdate still advances the same state machine.
+    var beat:Int = Std.int(Conductor.instance.currentStep / 4);
+    if (beat != extractedBeat)
+    {
+      extractedBeat = beat;
+      applyExtractedBeat();
+    }
+    if (dyn == null) return;
+    var bb:Dynamic = get(dyn, 'beatBounce');
+    if (bb == null) return;
+    var drop:Float = util_f(get(bb, 'drop'), 0);
+    if (drop == 0) return;
+    var dur:Float = util_f(get(bb, 'dur'), 0.3);
+    var count:Int = Std.int(util_f(get(bb, 'count'), 0));
+    var prefix:String = Std.string(get(bb, 'prefix'));
+    if (prefix == null || prefix == '') prefix = 'crowd';
+    for (i in 1...(count + 1))
+    {
+      var c = getNamedProp(prefix + i);
+      if (c == null) continue;
+      c.y += drop;
+      FlxTween.tween(c, {y: c.y - drop}, dur, {ease: FlxEase.circOut});
+    }
+  }
+
+  // Create a runtime shader from a registered .frag with baked uniforms.
+  function makeShader(spec:Dynamic):FlxRuntimeShader
+  {
+    if (spec == null) return null;
+    var frag:String = Std.string(get(spec, 'frag'));
+    if (frag == null || frag == '') return null;
+    try
+    {
+      var text:String = Assets.getText(Paths.frag(frag));
+      if (text == null || text == '')
+      {
+        trace('[FUNKY-COMPAT] Shader frag missing: ' + Paths.frag(frag));
+        return null;
+      }
+      var sh:FlxRuntimeShader = new FlxRuntimeShader(text);
+      var uni:Dynamic = get(spec, 'uniforms');
+      if (uni != null)
+      {
+        for (ui in 0...uni.length)
+        {
+          var pair:Dynamic = uni[ui];
+          sh.setFloat(Std.string(pair.k), util_f(pair.v, 0));
+        }
+      }
+      return sh;
+    }
+    catch (e:Dynamic)
+    {
+      trace('[FUNKY-COMPAT] Shader "$frag" failed to build: $e');
+      return null;
+    }
+  }
+
+  function util_f(v:Dynamic, fallback:Float):Float
+  {
+    if (v == null) return fallback;
+    var f:Float = Std.parseFloat(Std.string(v));
+    if (Math.isNaN(f)) return fallback;
+    return f;
+  }
+
+  function get(obj:Dynamic, key:String):Dynamic
+  {
+    if (obj == null) return null;
+    // NOTE: Reflect.* is blacklisted in HScript (silently caught below);
+    // ReflectUtil is the game's sanctioned alias.
+    try
+    {
+      return ReflectUtil.getField(obj, key);
+    }
+    catch (e:Dynamic)
+    {
+      return null;
+    }
+  }
+
+  function util_b(v:Dynamic, fallback:Bool):Bool
+  {
+    if (v == null) return fallback;
+    if (v == true) return true;
+    if (v == false) return false;
+    return fallback;
+  }
+}

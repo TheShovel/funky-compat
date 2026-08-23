@@ -1,0 +1,331 @@
+// funky-compat - experimental AWD2 (Away3D model) parser.
+// Parses Codename .awd model files entirely in memory using ByteArray's
+// NATIVE zlib (lime-compiled - NOT haxe.zip.InflateImpl, which SIGSEGVs).
+// Phase 1: validate parsing by tracing geometry stats at boot.
+
+import haxe.io.Bytes;
+import openfl.utils.ByteArray;
+import openfl.utils.Endian;
+import openfl.display.BitmapData;
+import lime.graphics.Image;
+import StringTools;
+import funkin.util.ReflectUtil;
+
+class FunkyCompat3D
+{
+  public var util:Dynamic;
+
+  function get(obj:Dynamic, key:String):Dynamic
+  {
+    if (obj == null) return null;
+    return ReflectUtil.getField(obj, key);
+  }
+
+  function set(obj:Dynamic, key:String, val:Dynamic):Void
+  {
+    ReflectUtil.setAnonymousField(obj, key, val);
+  }
+
+  public function new(util:Dynamic)
+  {
+    this.util = util;
+  }
+
+  // Parse an .awd file into a renderable model:
+  // {meshes:[{name, verts:[F], matrix:[12F]}]}
+  var cache:Dynamic = {};
+
+  public function parse(path:String, modelName:String):Dynamic
+  {
+    var cached:Dynamic = get(cache, path);
+    if (cached != null) return cached;
+    var data:Null<Bytes> = util.readRawBytes(path);
+    if (data == null || data.length < 16) return null;
+    var ba:ByteArray = ByteArray.fromBytes(data);
+    ba.endian = Endian.LITTLE_ENDIAN;
+    ba.position = 3;
+    var verMaj:Int = ba.readUnsignedByte();
+    var verMin:Int = ba.readUnsignedByte();
+    var flags:Int = ba.readUnsignedShort();
+    var compression:Int = ba.readUnsignedByte();
+    ba.readUnsignedInt(); // body length
+
+    var body:ByteArray = new ByteArray();
+    ba.readBytes(body, 0, ba.bytesAvailable);
+    if (compression == 1) body.uncompress();
+    body.endian = Endian.LITTLE_ENDIAN;
+    body.position = 0;
+
+    var accuracyGeo:Bool = (verMaj == 2 && verMin == 1) && ((flags & 4) == 4);
+    var vStride:Int = accuracyGeo ? 8 : 4;
+
+    // Block-id keyed stores
+    var geoms:Dynamic = {};   // id -> {verts}
+    var texAddrs:Dynamic = {}; // material id -> texture block id
+    var texKeys:Dynamic = {}; // texture id -> injected asset key
+    var texSizes:Dynamic = {};
+    var meshes:Array<Dynamic> = [];
+
+    while (body.position < body.length - 9)
+    {
+      var id:Int = body.readUnsignedInt();
+      body.readUnsignedByte(); // ns
+      var type:Int = body.readUnsignedByte();
+      var bflags:Int = body.readUnsignedByte();
+      var len:Int = body.readUnsignedInt();
+      var blk:ByteArray = new ByteArray();
+      body.readBytes(blk, 0, len);
+      if ((bflags & 8) == 8)
+      {
+        try { blk.uncompress(); } catch (e:Dynamic) {}
+      }
+      blk.endian = Endian.LITTLE_ENDIAN;
+      blk.position = 0;
+
+      if (type == 1)
+      {
+        var name:String = readVarStr(blk);
+        var numSubs:Int = blk.readUnsignedShort();
+        skipProps(blk);
+        var verts:Array<Float> = [];
+        var indices:Array<Int> = [];
+        var uvs:Array<Float> = [];
+        for (s in 0...numSubs)
+        {
+          if (blk.position >= blk.length) break;
+          var smLen:Int = blk.readUnsignedInt();
+          var smEnd:Int = blk.position + smLen;
+          skipProps(blk);
+          while (blk.position < smEnd && blk.position < blk.length)
+          {
+            var stype:Int = blk.readUnsignedByte();
+            blk.readUnsignedByte();
+            var slen:Int = blk.readUnsignedInt();
+            var send:Int = blk.position + slen;
+            if (stype == 1)
+            {
+              // AWD 2.1 with the precision flag stores vertex components as
+              // 64-bit doubles; older files use 32-bit floats. Reading the
+              // wrong width projects garbage (degenerate triangles).
+              var compSize:Int = accuracyGeo ? 8 : 4;
+              while (blk.position + compSize * 3 <= send)
+              {
+                verts.push(accuracyGeo ? blk.readDouble() : blk.readFloat());
+                verts.push(accuracyGeo ? blk.readDouble() : blk.readFloat());
+                verts.push(accuracyGeo ? blk.readDouble() : blk.readFloat());
+              }
+            }
+            else if (stype == 2)
+            {
+              // AWD index stream subtype 5 = unsigned 16-bit triangle indices.
+              while (blk.position + 2 <= send) indices.push(blk.readUnsignedShort());
+            }
+            else if (stype == 3)
+            {
+              // AWD UV stream: u/v pairs, same precision as vertices.
+              var uvSize:Int = accuracyGeo ? 8 : 4;
+              while (blk.position + uvSize * 2 <= send)
+              {
+                uvs.push(accuracyGeo ? blk.readDouble() : blk.readFloat());
+                uvs.push(accuracyGeo ? blk.readDouble() : blk.readFloat());
+              }
+            }
+            blk.position = send;
+          }
+        }
+        // Raw model-space bounds for diagnosis.
+        var bvx:Float = 0; var bvy:Float = 0; var bvz:Float = 0;
+        if (verts.length >= 3)
+        {
+          var mnx:Float = verts[0]; var mxx:Float = verts[0]; var mny:Float = verts[1]; var mxy:Float = verts[1]; var mnz:Float = verts[2]; var mxz:Float = verts[2];
+          for (vi in 1...Std.int(verts.length / 3))
+          {
+            if (verts[vi * 3] < mnx) mnx = verts[vi * 3];
+            if (verts[vi * 3] > mxx) mxx = verts[vi * 3];
+            if (verts[vi * 3 + 1] < mny) mny = verts[vi * 3 + 1];
+            if (verts[vi * 3 + 1] > mxy) mxy = verts[vi * 3 + 1];
+            if (verts[vi * 3 + 2] < mnz) mnz = verts[vi * 3 + 2];
+            if (verts[vi * 3 + 2] > mxz) mxz = verts[vi * 3 + 2];
+          }
+          bvx = mxx - mnx; bvy = mxy - mny; bvz = mxz - mnz;
+        }
+        set(geoms, Std.string(id), {verts: verts, indices: indices, uvs: uvs});
+        trace('[FUNKY-COMPAT-3D]   geom id=$id "$name": subs=$numSubs verts=' + Std.int(verts.length / 3) + ' span=(' + Math.round(bvx) + ',' + Math.round(bvy) + ',' + Math.round(bvz) + ')');
+      }
+      else if (type == 82)
+      {
+        // Bitmap texture block: name/path, bitmap type, byte length, PNG.
+        var textureName:String = readVarStr(blk);
+        if (blk.bytesAvailable >= 5)
+        {
+          blk.readUnsignedByte();
+          var pngLen:Int = blk.readUnsignedInt();
+          if (pngLen > 8 && pngLen <= blk.bytesAvailable)
+          {
+            var png:ByteArray = new ByteArray();
+            blk.readBytes(png, 0, pngLen);
+            var decoded:Dynamic = decodePng(png);
+            if (decoded != null)
+            {
+              set(texSizes, Std.string(id), decoded);
+              trace('[FUNKY-COMPAT-3D] texture id=$id "$textureName" decoded ' + decoded.w + 'x' + decoded.h);
+            }
+          }
+        }
+      }
+      else if (type == 81)
+      {
+        // Material: props key 2 = texture block address.
+        readVarStr(blk);
+        blk.readUnsignedByte(); // type
+        blk.readUnsignedByte(); // num methods
+        var listLen:Int = blk.readUnsignedInt();
+        var listEnd:Int = blk.position + listLen;
+        while (blk.position + 6 <= listEnd)
+        {
+          var key:Int = blk.readUnsignedShort();
+          var plen:Int = blk.readUnsignedInt();
+          if (key == 2 && plen == 4)
+          {
+            set(texAddrs, Std.string(id), blk.readUnsignedInt());
+            trace('[FUNKY-COMPAT-3D]   material $id -> texture ' + get(texAddrs, Std.string(id)));
+          }
+          else blk.position += plen;
+        }
+      }
+      else if (type == 23)
+      {
+        // Mesh instance: parent u32, matrix 12f, name, geo id u32, materials...
+        blk.position += 4;
+        var m:Array<Float> = [];
+        for (mi in 0...12) m.push(blk.readFloat());
+        var mName:String = readVarStr(blk);
+        var geoId:Int = blk.readUnsignedInt();
+        var mtxStr:String = '';
+        for (mi in 0...12) mtxStr += m[mi] + (mi == 11 ? '' : ',');
+        trace('[FUNKY-COMPAT-3D]   mesh instance "$mName" geo=$geoId mtx=[' + mtxStr + ']');
+        var numMats:Int = blk.readUnsignedShort();
+        var texId:Int = 0;
+        for (mm in 0...numMats)
+        {
+          var matId:Int = blk.readUnsignedInt();
+          if (texId == 0)
+          {
+            var ta:Dynamic = get(texAddrs, Std.string(matId));
+            if (ta != null) texId = ta;
+          }
+        }
+        var g:Dynamic = get(geoms, Std.string(geoId));
+        if (g != null)
+        {
+          var meshOut:Dynamic = {name: mName, verts: get(g, 'verts'), indices: get(g, 'indices'), uvs: get(g, 'uvs'), matrix: m};
+          var texInfo:Dynamic = texId == 0 ? null : get(texSizes, Std.string(texId));
+          if (texInfo != null)
+          {
+            set(meshOut, 'texW', texInfo.w);
+            set(meshOut, 'texH', texInfo.h);
+            set(meshOut, 'texPixels', texInfo.pixels);
+          }
+          meshes.push(meshOut);
+        }
+      }
+    }
+
+    if (meshes.length == 0) return null;
+    var result:Dynamic = {meshes: meshes};
+    // Keep the first decoded texture at model level for the software renderer.
+    for (meshResult in meshes)
+    {
+      if (get(meshResult, 'texPixels') != null)
+      {
+        set(result, 'texW', get(meshResult, 'texW'));
+        set(result, 'texH', get(meshResult, 'texH'));
+        set(result, 'texPixels', get(meshResult, 'texPixels'));
+        break;
+      }
+    }
+    set(cache, path, result);
+    return result;
+  }
+
+  // lime Image.fromBytes wants haxe.io.Bytes; wrap the ByteArray's storage.
+  static function ByteArrToBytes(ba:ByteArray):Bytes
+  {
+    return ba.getData();
+  }
+
+  function decodePng(png:ByteArray):Dynamic
+  {
+    try
+    {
+      var img:Dynamic = Image.fromBytes(png);
+      if (img == null || img.width <= 0 || img.height <= 0) return null;
+      var bd:Dynamic = img.buffer == null ? null : img.buffer.data;
+      if (bd == null) return null;
+      var buf:Dynamic = ReflectUtil.getField(bd, 'buffer');
+      var raw:Dynamic = buf == null ? null : ReflectUtil.getField(buf, 'b');
+      if (raw == null) return null;
+      var bytes:Bytes = Bytes.ofData(raw);
+      var fmt:String = Std.string(img.buffer.format);
+      var sourceW:Int = Std.int(img.width);
+      var sourceH:Int = Std.int(img.height);
+      var sample:Int = Std.int(Math.ceil(Math.max(sourceW, sourceH) / 512));
+      if (sample < 1) sample = 1;
+      var outW:Int = Std.int(Math.ceil(sourceW / sample));
+      var outH:Int = Std.int(Math.ceil(sourceH / sample));
+      trace('[FUNKY-COMPAT-3D] embedded texture pixel format=' + fmt + ' source=' + sourceW + 'x' + sourceH);
+      var pixels:Array<Int> = [];
+      var bgra:Bool = fmt == '2' || StringTools.startsWith(fmt, 'BGRA');
+      var abgr:Bool = fmt == '3' || StringTools.startsWith(fmt, 'ABGR');
+      var argb:Bool = fmt == '1' || StringTools.startsWith(fmt, 'ARGB');
+      for (oy in 0...outH)
+      {
+        var sy:Int = oy * sample;
+        if (sy >= sourceH) sy = sourceH - 1;
+        for (ox in 0...outW)
+        {
+          var sx:Int = ox * sample;
+          if (sx >= sourceW) sx = sourceW - 1;
+          var off:Int = (sy * sourceW + sx) * 4;
+          if (off + 3 >= bytes.length) continue;
+          var r:Int; var g:Int; var b:Int; var a:Int;
+          if (bgra) { b = bytes.get(off); g = bytes.get(off + 1); r = bytes.get(off + 2); a = bytes.get(off + 3); }
+          else if (argb) { a = bytes.get(off); r = bytes.get(off + 1); g = bytes.get(off + 2); b = bytes.get(off + 3); }
+          else if (abgr) { a = bytes.get(off); b = bytes.get(off + 1); g = bytes.get(off + 2); r = bytes.get(off + 3); }
+          else { r = bytes.get(off); g = bytes.get(off + 1); b = bytes.get(off + 2); a = bytes.get(off + 3); }
+          pixels.push((a << 24) | (r << 16) | (g << 8) | b);
+        }
+      }
+      var alphaPixels:Int = 0;
+      for (decodedPixel in pixels) if ((decodedPixel >>> 24) > 0) alphaPixels++;
+      // Some Lime/OpenFL targets expose embedded AWD PNGs as RGBX or report
+      // an unrecognized pixel format, leaving the sampled alpha byte zero.
+      // These baked stage textures are opaque backgrounds; recover visibility
+      // without changing genuinely transparent textures.
+      if (alphaPixels == 0)
+      {
+        for (pixelIndex in 0...pixels.length) pixels[pixelIndex] = pixels[pixelIndex] | 0xFF000000;
+        trace('[FUNKY-COMPAT-3D] embedded texture had zero alpha; forced opaque fallback');
+      }
+      return {w: outW, h: outH, pixels: pixels};
+    }
+    catch (e:Dynamic)
+    {
+      trace('[FUNKY-COMPAT-3D] embedded texture decode failed: ' + e);
+      return null;
+    }
+  }
+
+  function readVarStr(ba:ByteArray):String
+  {
+    var len:Int = ba.readUnsignedShort();
+    return ba.readUTFBytes(len);
+  }
+
+  function skipProps(ba:ByteArray):Void
+  {
+    if (ba.position >= ba.length) return;
+    var listLen:Int = ba.readUnsignedInt();
+    ba.position += listLen;
+  }
+}

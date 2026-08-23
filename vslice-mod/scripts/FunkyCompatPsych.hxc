@@ -163,7 +163,26 @@ class FunkyCompatPsych
     convertStages(dir, out);
     trace('[FUNKY-COMPAT] (psych) $dir: image sweep...');
     sweepImages(dir, out);
+    trace('[FUNKY-COMPAT] (psych) $dir: shaders...');
+    sweepShaders(dir, out);
     trace('[FUNKY-COMPAT] (psych) $dir: done');
+  }
+
+  // Registers mod .frag/.vert shaders into the virtual cache so the
+  // generated ScriptedStages can construct FlxRuntimeShaders from them
+  // (V-Slice resolves shaders by Paths.frag -> assets/shaders/<name>.frag).
+  public function sweepShaders(dir:String, out:Dynamic):Void
+  {
+    if (!util.pathExists('mods/$dir/shaders')) return;
+    var files:Array<String> = util.listDir('mods/$dir/shaders');
+    for (f in files)
+    {
+      var lower:String = f.toLowerCase();
+      if (!StringTools.endsWith(lower, '.frag') && !StringTools.endsWith(lower, '.vert')) continue;
+      var text:String = util.readText('mods/$dir/shaders/$f');
+      if (text == null) continue;
+      out.texts.push({paths: util.shaderKeys(f), content: text});
+    }
   }
 
   // ------------------------------------------------------------------

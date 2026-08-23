@@ -8,10 +8,12 @@
 import haxe.Json;
 import StringTools;
 import funkin.util.ReflectUtil;
+import flixel.FlxG;
 
 class FunkyCompatCodename
 {
   public var util:FunkyCompatUtil;
+  var three:FunkyCompat3D;
 
   // charId -> {w, h, s} frame dims + base scale (for top-left -> feet
   // anchor conversion in stages).
@@ -23,6 +25,10 @@ class FunkyCompatCodename
   // from the first song's scripts (the "hidethings" pattern: sprites hidden
   // until an HScript Call event reveals them).
   var stageSpritePatch:Dynamic;
+  // stageId -> Codename HScript Call events collected from imported charts.
+  // These are replayed by DynStage because V-Slice cannot execute the
+  // original stage script callbacks.
+  var stageCallEvents:Dynamic;
   // Optional tuning knobs from the layer's own config.json
   // (mods/funky-compat/config.json):
   //   cameraBiasY:      adds to the baked stage camera Y offset (moves the
@@ -45,6 +51,7 @@ class FunkyCompatCodename
     this.charMetrics = {};
     this.stageCharHints = {};
     this.stageSpritePatch = {};
+    this.stageCallEvents = {};
     this.layerConfig = null;
     this.usedStageIds = {};
     this.detectedAspect = 0;
@@ -862,15 +869,25 @@ class FunkyCompatCodename
             {
               util.warn('Codename: extra characters on a strumline in $songId ($diff) are not rendered');
             }
-            // Girlfriend strumline: not representable natively, skip its
-            // notes. Matches Codename's slot resolution (a GF line may carry
-            // type 0 with position="girlfriend" - e.g. gumballs "memory card").
+            // V-Slice has no playable third strumline, but it does have a GF
+            // character target. Preserve GF-line notes as animation events so
+            // extra singers (notably GF-position characters) still animate;
+            // their per-character vocal track is registered normally below.
             if (strumlineCharSlot(line, lineType) == 'girlfriend')
             {
               var gfNotes:Dynamic = get(line, 'notes');
-              if (gfNotes != null && gfNotes.length > 0)
+              if (gfNotes != null)
               {
-                util.warn('Codename: GF strumline notes skipped in $songId ($diff)');
+                for (gni in 0...gfNotes.length)
+                {
+                  var gfNote:Dynamic = gfNotes[gni];
+                  if (gfNote == null) continue;
+                  var gfTime:Float = util.getFloat(get(gfNote, 'time'), 0);
+                  var gfId:Int = util.getInt(get(gfNote, 'id'), 0);
+                  var gfType:Int = util.getInt(get(gfNote, 'type'), 0);
+                  if (gfType == 0)
+                    eventsArr.push({time: gfTime, name: 'Play Animation', params: [2, codenameSingAnim(gfId)]});
+                }
               }
               continue;
             }
@@ -1034,6 +1051,46 @@ class FunkyCompatCodename
         stageId = resolveStageId(dir, stageId);
       }
       if (stageId != '') set(usedStageIds, stageId, true);
+
+      // Preserve portable Codename HScript Call events for the generated
+      // stage. This is intentionally keyed by the resolved stage id, so
+      // namespaced stages still receive their original chart callbacks.
+      if (stageId != '')
+      {
+        var calls:Array<Dynamic> = get(stageCallEvents, stageId);
+        if (calls == null) calls = [];
+        var rawStageEvents:Array<Dynamic> = [];
+        var chartStageEvents:Dynamic = chart0 == null ? null : get(chart0, 'events');
+        if (chartStageEvents != null)
+        {
+          for (chartEvent in chartStageEvents) rawStageEvents.push(chartEvent);
+        }
+        for (globalEvent in globalEvents) rawStageEvents.push(globalEvent);
+        for (rawCall in rawStageEvents)
+        {
+          if (rawCall == null) continue;
+          if (util.getString(get(rawCall, 'name'), '') != 'HScript Call') continue;
+          var callParams:Dynamic = get(rawCall, 'params');
+          if (callParams == null || callParams.length < 1) continue;
+          var callFn:String = util.getString(callParams[0], '');
+          if (callFn == '') continue;
+          var callTime:Float = util.getFloat(get(rawCall, 'time'), 0);
+          var duplicate:Bool = false;
+          for (existing in calls)
+          {
+            if (existing != null
+              && util.getFloat(get(existing, 't'), -1) == callTime
+              && util.getString(get(existing, 'fn'), '') == callFn)
+            {
+              duplicate = true;
+              break;
+            }
+          }
+          if (!duplicate)
+            calls.push({t: callTime, step: eventStep(callTime, bpm, timeChangeEvents), fn: callFn, args: callParams});
+        }
+        set(stageCallEvents, stageId, calls);
+      }
 
       // Square/4:3-era mods framed their stages for a narrower view. The
       // framed width comes from an explicit config override (modAspects /
@@ -1208,6 +1265,27 @@ class FunkyCompatCodename
       return renamed;
     }
     return stageId;
+  }
+
+  // Convert an event timestamp to the conductor step at which Codename
+  // dispatches it. This accounts for BPM changes, unlike t/(beat length).
+  public function eventStep(t:Float, baseBpm:Float, changes:Array<Dynamic>):Int
+  {
+    var step:Float = 0;
+    var prev:Float = 0;
+    var currentBpm:Float = baseBpm;
+    for (change in changes)
+    {
+      if (change == null) continue;
+      var ct:Float = util.getFloat(get(change, 't'), 0);
+      if (ct <= prev || ct > t) continue;
+      step += (ct - prev) / (60000 / currentBpm / 4);
+      prev = ct;
+      var nextBpm:Float = util.getFloat(get(change, 'bpm'), -1);
+      if (nextBpm > 0) currentBpm = nextBpm;
+    }
+    if (t > prev) step += (t - prev) / (60000 / currentBpm / 4);
+    return Std.int(Math.floor(step + 0.0001));
   }
 
   // Map codename events to vslice events.
@@ -1388,6 +1466,17 @@ class FunkyCompatCodename
       }
     }
     return result;
+  }
+
+  public function codenameSingAnim(id:Int):String
+  {
+    switch (id % 4)
+    {
+      case 0: return 'singLEFT';
+      case 1: return 'singDOWN';
+      case 2: return 'singUP';
+      default: return 'singRIGHT';
+    }
   }
 
   public function strumlineName(idx:Int):String
@@ -2341,6 +2430,19 @@ class FunkyCompatCodename
           px += util.getFloat(propDims.w, 0) * (1 - scaleX) / 2;
           py += util.getFloat(propDims.h, 0) * (1 - scaleY) / 2;
         }
+        // Codename leaves stage sprites at their XML x/y unless the author
+        // explicitly requests updateHitbox. V-Slice updates every prop's
+        // hitbox before assigning its position. Restore the authored Sparrow
+        // source-rectangle placement for the default (no-updateHitbox) case:
+        // trimmed frames with negative frameX/frameY otherwise render left/up
+        // of their Codename position. This is data-driven and applies to any
+        // trimmed stage atlas, not just the highschool crowd.
+        if (attr(body, 'updateHitbox') != 'true' && frameTrims != null && frameTrims.length > 0)
+        {
+          var firstTrim:Dynamic = frameTrims[0];
+          px -= util.getFloat(get(firstTrim, 'fx'), 0) * scaleX;
+          py -= util.getFloat(get(firstTrim, 'fy'), 0) * scaleY;
+        }
 
         var prop:Dynamic = {
           name: name,
@@ -2398,7 +2500,11 @@ class FunkyCompatCodename
         // crowd hover the way it does in the original engine). Set
         // stageBias.<id>.crowdGround=false in the layer config to get the
         // untouched, author-placed version instead.
-        var crowdGround:Bool = true;
+        // Preserve Codename's authored position by default. Ground-plane
+        // correction is an optional compatibility override for stages whose
+        // art explicitly requires it; applying it globally moves some props
+        // above their original y coordinate.
+        var crowdGround:Bool = false;
         var cfgGround:Dynamic = getLayerConfig();
         var stageGroundBias:Dynamic = get(cfgGround, 'stageBias');
         if (stageGroundBias != null)
@@ -2541,13 +2647,52 @@ class FunkyCompatCodename
       out.stages.push(stageId);
       util.claimForeign('stages', stageId);
 
-      // Generate ScriptedStage .hxc with raw Codename anchor data baked in.
-      var stageScript:String = generateStageScript(stageId, stageId, xmlText);
-      if (stageScript != null && stageScript.length > 0)
+      // Register assets referenced only by stage HScript (for example
+      // dynamically-created background atlases). The normal stage XML pass
+      // cannot see these, and sweepImages intentionally skips stage PNGs.
+      registerStageScriptAssets(dir, stageId, stageFileBase, out);
+
+      // Generate runtime config for the generic FunkyCompatDynStage.
+      var dynCfg:Dynamic = buildDynCfg(dir, stageId, stageFileBase, xmlText);
+      if (dynCfg != null)
       {
         if (out.stageScripts == null) out.stageScripts = [];
-        out.stageScripts.push({id: stageId, content: stageScript});
+        out.stageScripts.push({id: stageId, cfg: dynCfg});
       }
+    }
+  }
+
+  // Register PNG/XML pairs referenced directly by a stage HScript. Asset keys
+  // follow the converted stage id so namespaced stages resolve correctly at
+  // runtime even though the script still contains its original stage path.
+  public function registerStageScriptAssets(dir:String, stageId:String, baseId:String, out:Dynamic):Void
+  {
+    var text:String = stageScriptText(dir, baseId);
+    if (text == null || text == '') text = stageScriptText(dir, stageId);
+    if (text == null || text == '') return;
+    var lines:Array<String> = text.split('\\n');
+    for (raw in lines)
+    {
+      var line:String = StringTools.trim(raw);
+      var marker:String = '';
+      var p:Int = line.indexOf('Paths.getSparrowAtlas(');
+      if (p < 0) p = line.indexOf('Paths.image(');
+      if (p < 0) continue;
+      var q1:Int = line.indexOf("'", p);
+      var quote:String = "'";
+      var qAlt:Int = line.indexOf('"', p);
+      if (qAlt >= 0 && (q1 < 0 || qAlt < q1)) { q1 = qAlt; quote = '"'; }
+      if (q1 < 0) continue;
+      var q2:Int = line.indexOf(quote, q1 + 1);
+      if (q2 <= q1) continue;
+      var rel:String = line.substring(q1 + 1, q2);
+      if (!StringTools.startsWith(rel, 'stages/')) continue;
+      var diskRel:String = rel;
+      var keyRel:String = rel;
+      var oldRoot:String = 'stages/$baseId';
+      if (stageId != baseId && StringTools.startsWith(rel, oldRoot))
+        keyRel = 'stages/$stageId' + rel.substring(oldRoot.length);
+      addImage(out, dir, '$diskRel.png', '$keyRel.png');
     }
   }
 
@@ -2810,8 +2955,10 @@ class FunkyCompatCodename
   // Generate a ScriptedStage .hxc for a Codename stage.
   // Bakes in raw anchor data and overrides addCharacter() to position
   // characters using Codename's exact logic at play time.
-  public function generateStageScript(variantId:String, stageId:String, xmlText:String):String
+  public function generateStageScript(variantId:String, stageId:String, xmlText:String, dir:String):String
   {
+    // Parse the stage script for portable shader/runtime behaviors to embed.
+    var scriptExtra:String = stageScriptRuntime(dir, stageId);
     // Parse character anchor positions from the XML
     var bfBody:String = '';
     var gfBody:String = '';
@@ -2871,6 +3018,15 @@ class FunkyCompatCodename
     sb.add('import funkin.play.stage.Stage;\n');
     sb.add('import funkin.play.character.BaseCharacter;\n');
     sb.add('import funkin.play.character.CharacterType;\n');
+    // Common imports for replayed stage-script effects (shaders, overlays,
+    // tweens). Unused imports are harmless in HScript.
+    sb.add('import flixel.FlxG;\n');
+    sb.add('import flixel.FlxSprite;\n');
+    sb.add('import flixel.util.FlxColor;\n');
+    sb.add('import flixel.tweens.FlxTween;\n');
+    sb.add('import flixel.tweens.FlxEase;\n');
+    sb.add('import flixel.addons.display.FlxRuntimeShader;\n');
+    sb.add('import openfl.display.BlendMode;\n');
     sb.add('class ' + className + ' extends Stage\n');
     sb.add('{\n');
 
@@ -2963,9 +3119,1586 @@ class FunkyCompatCodename
 
     sb.add('    }\n');
     sb.add('  }\n');
+
+    // Script-derived runtime behaviors (shaders, overlays, beat/step logic)
+    if (scriptExtra != null && scriptExtra.length > 0)
+    {
+      sb.add(scriptExtra);
+    }
+
     sb.add('}\n');
 
     return sb.toString();
+  }
+
+// ------------------------------------------------------------------
+  // Stage script runtime embedding (portable subset)
+  // ------------------------------------------------------------------
+
+  // Parse the stage .hx script for portable runtime behaviors and emit
+  // them as HScript methods on the generated ScriptedStage.
+  // Supported patterns:
+  //   - new CustomShader('name') -> FlxRuntimeShader from the registered .frag
+  //   - <sprite>.shader = <shader> on named stage props / characters
+  //   - new FlxSprite(x, y) overlays in postCreate (makeGraphic + shader +
+  //     blend + scrollFactor) -> added as named props on core layer
+  //   - beatHit crowd bobbing (y += dropAmount + FlxTween back)
+  //   - beatHit crowd image swaps (loadGraphic with toggle)
+  //   - stepHit black-bar/overlay effects on specific steps
+  // Everything else is dropped with a warning.
+  public function stageScriptRuntime(dir:String, stageId:String):String
+  {
+    var scriptText:String = stageScriptText(dir, stageId);
+    if (scriptText == null || scriptText == '') return '';
+    var lines:Array<String> = scriptText.split('\n');
+
+    var sb:StringBuf = new StringBuf();
+    var importsNeeded:Array<String> = [];
+    var shaderVars:Array<String> = []; // names of shader variables created
+    var spriteVars:Array<String> = []; // local FlxSprite variables created in postCreate
+    var warnings:Array<String> = [];
+    var inPostCreate:Bool = false;
+    var inBeatHit:Bool = false;
+    var inStepHit:Bool = false;
+    var inUpdate:Bool = false;
+    var braceDepth:Int = 0;
+    var postCreateCode:StringBuf = new StringBuf();
+    var beatHitCode:StringBuf = new StringBuf();
+    var stepHitCode:StringBuf = new StringBuf();
+    var updateCode:StringBuf = new StringBuf();
+    var beaten:Bool = false;
+    var stepped:Bool = false;
+    var updated:Bool = false;
+
+    // First pass: find function bodies we care about (top-level only).
+    var funcBodies:Dynamic = {};
+    var curFunc:String = '';
+    var depthAtFuncStart:Int = 0;
+    var bodyStart:Int = 0;
+    for (i in 0...lines.length)
+    {
+      var line:String = StringTools.trim(lines[i]);
+      var openCount:Int = countChar(line, '{');
+      var closeCount:Int = countChar(line, '}');
+      if (line.indexOf('function ') >= 0)
+      {
+        // Top-level function declaration: ends with '{' (possibly after code)
+        var fnName:String = extractFnName(line);
+        if (fnName != '')
+        {
+          curFunc = fnName;
+          depthAtFuncStart = braceDepth + openCount - closeCount - 1; // brace depth INSIDE after opening
+          bodyStart = i;
+          set(funcBodies, fnName, {start: i, depth: depthAtFuncStart, body: '', end: -1});
+        }
+      }
+      braceDepth += openCount - closeCount;
+      if (curFunc != '')
+      {
+        var body:String = Std.string(get(get(funcBodies, curFunc), 'body'));
+        body += lines[i];
+        body += '\n';
+        set(get(funcBodies, curFunc), 'body', body);
+        if (braceDepth <= depthAtFuncStart && closeCount > 0 && i > bodyStart)
+        {
+          set(get(funcBodies, curFunc), 'end', i);
+          curFunc = '';
+        }
+      }
+    }
+
+    var bodyOf = function(name:String):String
+    {
+      var b:Dynamic = get(funcBodies, name);
+      if (b == null) return '';
+      return Std.string(get(b, 'body'));
+    };
+
+    // --- Shaders: collect 'new CustomShader('x')' + the var it's assigned to
+    var shaderInfos:Array<Dynamic> = [];
+    var spriteInfos:Array<Dynamic> = []; // {var, x, y, chainLines}
+    var spriteChains:Dynamic = {}; // varName -> accumulated chain text
+
+    for (lineRaw in lines)
+    {
+      var line:String = StringTools.trim(lineRaw);
+      if (line == '') continue;
+
+      // var X = new CustomShader('name');
+      var csIdx:Int = line.indexOf('new CustomShader(');
+      if (csIdx >= 0)
+      {
+        var after:Int = line.indexOf('(', csIdx + 'new CustomShader'.length);
+        var close:Int = line.indexOf(')', after);
+        if (after >= 0 && close > after)
+        {
+          var nameArg:String = StringTools.trim(line.substring(after + 1, close));
+          nameArg = stripQuotes(nameArg);
+          if (nameArg != '')
+          {
+            // Determine the variable name (var X = ... or .shader = new ...)
+            var varName:String = '';
+            var assignToProp:String = '';
+            var eqIdx:Int = line.indexOf('=');
+            var isShaderAssign:Bool = (line.indexOf('.shader') >= 0);
+            if (isShaderAssign)
+            {
+              var dotIdx:Int = line.indexOf('.shader');
+              assignToProp = StringTools.trim(line.substring(0, dotIdx));
+            }
+            else if (eqIdx > 0 && line.indexOf('var ') >= 0)
+            {
+              var vStart:Int = line.indexOf('var ') + 4;
+              varName = StringTools.trim(line.substring(vStart, eqIdx));
+              // strip type annotation
+              var colon:Int = varName.indexOf(':');
+              if (colon > 0) varName = StringTools.trim(varName.substring(0, colon));
+            }
+            shaderInfos.push({name: nameArg, var: varName, prop: assignToProp});
+            if (varName != '' && shaderVars.indexOf(varName) < 0) shaderVars.push(varName);
+          }
+        }
+      }
+
+      // Shader uniform assignments: <shaderVar>.<uniform> = <number>;
+      for (sv in shaderVars)
+      {
+        var pat:String = sv + '.';
+        var pIdx:Int = line.indexOf(pat);
+        if (pIdx >= 0 && line.indexOf('=') > pIdx)
+        {
+          var uname:String = StringTools.trim(line.substring(pIdx + pat.length));
+          var eq2:Int = uname.indexOf('=');
+          if (eq2 > 0)
+          {
+            uname = StringTools.trim(uname.substring(0, eq2));
+            var val:Float = Std.parseFloat(StringTools.trim(line.substring(pIdx + pat.length + eq2 + 1)));
+            // only static numeric assignments bake in; skip time-based
+            if (!Math.isNaN(val))
+            {
+              shaderInfos.push({name: '', var: sv, uniform: uname, value: val, prop: ''});
+            }
+          }
+        }
+      }
+
+      // new FlxSprite(..) overlays in postCreate / create
+      var flxIdx:Int = line.indexOf('new FlxSprite(');
+      if (flxIdx >= 0 && (line.indexOf('postCreate') >= 0 || inPostCreate || line.indexOf('function create') >= 0))
+      {
+        var after2:Int = line.indexOf('(', flxIdx + 'new FlxSprite'.length);
+        var close2:Int = line.indexOf(')', after2);
+        if (after2 >= 0 && close2 > after2)
+        {
+          var args:String = line.substring(after2 + 1, close2);
+          var vName:String = '';
+          var eqIdx2:Int = line.indexOf('=');
+          if (line.indexOf('var ') >= 0)
+          {
+            var vStart2:Int = line.indexOf('var ') + 4;
+            vName = StringTools.trim(line.substring(vStart2, eqIdx2));
+            var colon2:Int = vName.indexOf(':');
+            if (colon2 > 0) vName = StringTools.trim(vName.substring(0, colon2));
+          }
+          if (vName != '')
+          {
+            spriteInfos.push({var: vName, args: args, x: 0, y: 0});
+            spriteVars.push(vName);
+          }
+        }
+      }
+    }
+
+    // --- Generate shader creation code (in onCreate) ---
+    var shaderCreated:Array<String> = [];
+    var extraOnCreate:StringBuf = new StringBuf();
+    var uniqueShaders:Array<String> = [];
+    for (si in 0...shaderInfos.length)
+    {
+      var info:Dynamic = shaderInfos[si];
+      var sname:String = Std.string(get(info, 'name'));
+      var svar:String = Std.string(get(info, 'var'));
+      var sprop:String = Std.string(get(info, 'prop'));
+      var runiform:String = Std.string(get(info, 'uniform'));
+      if (sname != '')
+      {
+        if (uniqueShaders.indexOf(sname) < 0)
+        {
+          uniqueShaders.push(sname);
+          var safeShaderVar:String = 'shader_' + sanitizeClassName(sname);
+          if (svar != '')
+          {
+            // Keep the original variable name so later assignments match
+            safeShaderVar = svar;
+          }
+          extraOnCreate.add('    var ' + safeShaderVar + ' = new flixel.addons.display.FlxRuntimeShader(funkin.Assets.getText(funkin.Paths.frag("' + sname + '")));\n');
+          if (importsNeeded.indexOf('flixel.addons.display.FlxRuntimeShader') < 0) importsNeeded.push('flixel.addons.display.FlxRuntimeShader');
+          shaderCreated.push(svar != '' ? svar : safeShaderVar);
+        }
+
+        // Apply to a stage prop or character
+        if (sprop != '')
+        {
+          var target:String = mapStageRef(sprop, stageId);
+          // The shader variable is on the right side: .shader = X or .shader = new CustomShader(...)
+          var rhs:String = svar != '' ? svar : ('shader_' + sanitizeClassName(sname));
+          extraOnCreate.add('    var propRef = ' + target + ';\n');
+          extraOnCreate.add('    if (propRef != null) propRef.shader = ' + rhs + ';\n');
+        }
+      }
+      else if (runiform != '' && svar != '')
+      {
+        extraOnCreate.add('    ' + svar + '.setFloat("' + runiform + '", ' + Std.string(get(info, 'value')) + ');\n');
+      }
+    }
+
+    // --- Overlay sprites from postCreate (fog, blend overlays) ---
+    var postBody:String = bodyOf('postCreate');
+    if (postBody == '') postBody = bodyOf('create');
+    if (postBody != '')
+    {
+      // Simple approach: replay makeGraphic/shader/blend/scrollFactor/add lines
+      // in order, translating stage refs.
+      var plines:Array<String> = postBody.split('\n');
+      var localVars:Array<String> = [];
+      // Skip non-portable guarded blocks wholesale (e.g. GUNLICK's
+      // 'if (use3D)' 3D mode: its body references identifiers and APIs that
+      // do not exist in the generated class, and emitting them raw would
+      // throw at onCreate runtime and abort every effect queued AFTER the
+      // block - fog overlays, blend modes, etc. The block's visuals are
+      // opt-in in the original mod too (use3D defaults false).
+      var skipUntilDepth:Int = -1;
+      var replayDepth:Int = 0;
+      for (pl in plines)
+      {
+        var p:String = StringTools.trim(pl);
+        if (p == '' || p.indexOf('function ') >= 0) continue;
+        if (p == '{' || p == '}') continue;
+        var oc:Int = countChar(p, '{');
+        var cc:Int = countChar(p, '}');
+        // Inside a skipped block: track depth until it closes.
+        if (skipUntilDepth >= 0)
+        {
+          replayDepth += oc - cc;
+          if (replayDepth <= skipUntilDepth) skipUntilDepth = -1;
+          continue;
+        }
+        // Guard-block start: skip the whole block.
+        if ((p.indexOf('if (use3D') == 0 || p.indexOf('if(use3D') == 0))
+        {
+          if (oc == 0 && cc == 0) continue; // braceless single-line guard
+          replayDepth += oc - cc;
+          skipUntilDepth = replayDepth - 1;
+          continue;
+        }
+        replayDepth += oc - cc;
+        if (p.indexOf('var ') >= 0 && p.indexOf('= new FlxSprite') >= 0)
+        {
+          // var X = new FlxSprite(x, y); -> create sprite
+          var vStart:Int = p.indexOf('var ') + 4;
+          var eqIdx:Int = p.indexOf('=');
+          var vName:String = StringTools.trim(p.substring(vStart, eqIdx));
+          var colon:Int = vName.indexOf(':');
+          if (colon > 0) vName = StringTools.trim(vName.substring(0, colon));
+          localVars.push(vName);
+          extraOnCreate.add('    var ' + vName + ' = new flixel.FlxSprite();\n');
+        }
+        else if (p.indexOf('.makeGraphic(') >= 0 || p.indexOf('.loadGraphic(') >= 0)
+        {
+          // translate Paths.image('...') -> funkin.Paths.image('...')
+          var translated:String = translatePaths(p);
+          extraOnCreate.add('    ' + translated + '\n');
+        }
+        else if (p.indexOf('.shader = ') >= 0 || p.indexOf('.blend = ') >= 0 || p.indexOf('.scrollFactor.set(') >= 0
+          || p.indexOf('.scale.set(') >= 0 || p.indexOf('.angle = ') >= 0 || p.indexOf('.alpha = ') >= 0
+          || p.indexOf('.cameras = ') >= 0 || p.indexOf('.screenCenter') >= 0)
+        {
+          // Chained assignments ('a.x = b.x = v') are not valid HScript and
+          // bare character identifiers don't exist in the generated class.
+          // Only replay single assignments whose target is a known local var
+          // or a mappable stage/character ref; drop anything else.
+          var eqCount:Int = 0;
+          for (ci in 0...p.length)
+          {
+            if (p.charAt(ci) == '=')
+            {
+              if (ci + 1 < p.length && p.charAt(ci + 1) == '=') ci++; // skip ==
+              else if (ci > 0 && (p.charAt(ci - 1) == '!' || p.charAt(ci - 1) == '<' || p.charAt(ci - 1) == '>' || p.charAt(ci - 1) == '+' || p.charAt(ci - 1) == '-')) {}
+              else eqCount++;
+            }
+          }
+          var firstEq:Int = p.indexOf('=');
+          var lhs:String = StringTools.trim(p.substring(0, firstEq));
+          var mapped:String = mapStageRef(lhs, stageId);
+          var isKnown:Bool = false;
+          for (lv in localVars)
+          {
+            if (lv == lhs) isKnown = true;
+          }
+          for (sv2 in shaderVars)
+          {
+            if (sv2 == lhs) isKnown = true;
+          }
+          if (eqCount <= 1 && (isKnown || mapped != lhs))
+          {
+            extraOnCreate.add('    ' + mapped + StringTools.trim(p.substring(firstEq)) + '\n');
+          }
+        }
+        else if (p.indexOf('add(') >= 0 && p.indexOf('stage.add') < 0)
+        {
+          // add(X) -> set zIndex above characters, then this.add(X)
+          var addArg:String = p.substring(p.indexOf('(') + 1, p.indexOf(')'));
+          extraOnCreate.add('    if (' + addArg + ' != null)
+');
+          extraOnCreate.add('    {
+');
+          extraOnCreate.add('      ' + addArg + '.zIndex = 5000;
+');
+          extraOnCreate.add('      this.add(' + addArg + ');
+');
+          extraOnCreate.add('    }
+');
+        }
+        else if (p.indexOf('insert(') >= 0)
+        {
+          extraOnCreate.add('    ' + translatePaths(p) + '\n');
+        }
+        else if (p.indexOf('FlxTween') >= 0 || p.indexOf('FlxEase') >= 0)
+        {
+          if (importsNeeded.indexOf('flixel.tweens.FlxTween') < 0) importsNeeded.push('flixel.tweens.FlxTween');
+          extraOnCreate.add('    ' + translatePaths(p) + '\n');
+        }
+        else if (p.indexOf('return') >= 0 || p.indexOf('super.') >= 0 || p.indexOf('if (use3D') >= 0 || p.indexOf('apply3D') >= 0)
+        {
+          // skip non-portable
+        }
+        else if (p.indexOf('}') == 0)
+        {
+          // skip
+        }
+      }
+      // Note: we never call super.onCreate here because buildStage already
+      // ran for the JSON props; overlays are added after.
+    }
+
+    // --- beatHit ---
+    var beatBody:String = bodyOf('beatHit');
+    if (beatBody != '')
+    {
+      var blines:Array<String> = beatBody.split('\n');
+      var crowdDrop:Float = 0;
+      var durationUp:Float = 0.3;
+      for (bl in blines)
+      {
+        var b:String = StringTools.trim(bl);
+        if (b.indexOf('dropAmount') >= 0 && b.indexOf('=') >= 0)
+        {
+          var dv:Float = Std.parseFloat(StringTools.trim(b.substring(b.indexOf('=') + 1)));
+          if (!Math.isNaN(dv)) crowdDrop = dv;
+        }
+        if (b.indexOf('durationUp') >= 0 && b.indexOf('=') >= 0)
+        {
+          var dv2:Float = Std.parseFloat(StringTools.trim(b.substring(b.indexOf('=') + 1)));
+          if (!Math.isNaN(dv2)) durationUp = dv2;
+        }
+      }
+      // Generic crowd bob: for i in 1..5, crowd{i}.y += drop, tween back
+      if (crowdDrop != 0)
+      {
+        beatHitCode.add('    for (i in 1...5)\n');
+        beatHitCode.add('    {\n');
+        beatHitCode.add('      var c = getNamedProp("crowd" + i);\n');
+        beatHitCode.add('      if (c != null)\n');
+        beatHitCode.add('      {\n');
+        beatHitCode.add('        c.y += ' + Std.string(crowdDrop) + ';\n');
+        beatHitCode.add('        flixel.tweens.FlxTween.tween(c, {y: c.y - ' + Std.string(crowdDrop) + '}, ' + Std.string(durationUp) + ', {ease: flixel.util.FlxEase.circOut});\n');
+        beatHitCode.add('      }\n');
+        beatHitCode.add('    }\n');
+        if (importsNeeded.indexOf('flixel.tweens.FlxTween') < 0) importsNeeded.push('flixel.tweens.FlxTween');
+        if (importsNeeded.indexOf('flixel.util.FlxEase') < 0) importsNeeded.push('flixel.util.FlxEase');
+        beaten = true;
+      }
+      // Image swaps: <sprite>.loadGraphic(Paths.image(cond ? a : b)) with toggle
+      // -> getNamedProp('<name>').loadGraphic(funkin.Paths.image(...)) alternating
+      var loadIdx:Int = beatBody.indexOf('loadGraphic(Paths.image(');
+      if (loadIdx >= 0)
+      {
+        // Extract sprite name on that line
+        for (bl in blines)
+        {
+          var b2:String = StringTools.trim(bl);
+          var lIdx:Int = b2.indexOf('.loadGraphic(Paths.image(');
+          if (lIdx >= 0)
+          {
+            var sprName:String = StringTools.trim(b2.substring(0, lIdx));
+            // find the two string literals
+            var q1:Int = b2.indexOf('"', lIdx);
+            var q2:Int = b2.indexOf('"', q1 + 1);
+            var q3:Int = b2.indexOf('"', q2 + 1);
+            var q4:Int = b2.indexOf('"', q3 + 1);
+            if (q1 > 0 && q2 > q1 && q3 > q2 && q4 > q3)
+            {
+              var imgA:String = b2.substring(q1 + 1, q2);
+              var imgB:String = b2.substring(q3 + 1, q4);
+              var toggleVar:String = 'fc_toggle_' + sanitizeClassName(sprName);
+              beatHitCode.add('    var tgl = !' + toggleVar + ';\n');
+              beatHitCode.add('    ' + toggleVar + ' = tgl;\n');
+              beatHitCode.add('    var p = getNamedProp("' + sprName + '");\n');
+              beatHitCode.add('    if (p != null) p.loadGraphic(funkin.Paths.image(tgl ? "' + imgA + '" : "' + imgB + '"));\n');
+              // Declare toggle at class scope
+              sb.add('  var ' + toggleVar + ':Bool = false;\n');
+            }
+          }
+        }
+        beaten = true;
+      }
+    }
+    if (beaten && beatHitCode.length > 0)
+    {
+      sb.add('  function onBeatHit(event):Void\n');
+      sb.add('  {\n');
+      sb.add('    super.onBeatHit(event);\n');
+      sb.add(beatHitCode.toString());
+      sb.add('  }\n');
+    }
+
+    // --- stepHit: black bars / overlays on specific steps ---
+    var stepBody:String = bodyOf('stepHit');
+    if (stepBody != '')
+    {
+      var slines:Array<String> = stepBody.split('\n');
+      var songGuard:String = '';
+      // Detect an outer `if (curSong == "x")` guard so step effects only
+      // fire for that song (GUNLICK-style).
+      var songGuardIdx:Int = stepBody.indexOf('curSong');
+      if (songGuardIdx >= 0)
+      {
+        var qStart:Int = stepBody.indexOf('"', songGuardIdx);
+        if (qStart >= 0)
+        {
+          var qEnd:Int = stepBody.indexOf('"', qStart + 1);
+          if (qEnd > qStart)
+          {
+            songGuard = stepBody.substring(qStart + 1, qEnd);
+          }
+        }
+      }
+      for (sl in slines)
+      {
+        var s:String = StringTools.trim(sl);
+        if (s.indexOf('curStep') >= 0 && s.indexOf('==') >= 0)
+        {
+          var stepVal:Float = Std.parseFloat(StringTools.trim(s.substring(s.indexOf('==') + 2)));
+          if (!Math.isNaN(stepVal))
+          {
+            stepHitCode.add('    if ' + (songGuard != '' ? '(funkin.play.PlayState.instance.currentSong?.id == "' + songGuard + '") && ' : '') + '(event.curStep == ' + Std.int(stepVal) + ')\n');
+            stepHitCode.add('    {\n');
+            // capture following simple statements until closing brace
+            var capture:Int = slines.indexOf(sl) + 1;
+            while (capture < slines.length)
+            {
+              var nextLine:String = StringTools.trim(slines[capture]);
+              if (nextLine == '}') break;
+              if (nextLine == '' || nextLine.indexOf('function ') >= 0)
+              {
+                capture++;
+                continue;
+              }
+              if (nextLine.indexOf('.makeGraphic(') >= 0 || nextLine.indexOf('.scrollFactor') >= 0
+                || nextLine.indexOf('.screenCenter') >= 0 || nextLine.indexOf('.alpha') >= 0
+                || nextLine.indexOf('new FlxSprite') >= 0 || nextLine.indexOf('.loadGraphic') >= 0
+                || nextLine.indexOf('insert(') >= 0 || nextLine.indexOf('add(') >= 0
+                || nextLine.indexOf('remove(') >= 0 || nextLine.indexOf('FlxTween') >= 0
+                || nextLine.indexOf('visible =') >= 0 || nextLine.indexOf('.shader =') >= 0)
+              {
+                stepHitCode.add('      ' + translatePaths(nextLine) + '\n');
+              }
+              capture++;
+            }
+            stepHitCode.add('    }\n');
+            stepped = true;
+          }
+        }
+      }
+    }
+    if (stepped && stepHitCode.length > 0)
+    {
+      sb.add('  function onStepHit(event):Void\n');
+      sb.add('  {\n');
+      sb.add('    super.onStepHit(event);\n');
+      sb.add(stepHitCode.toString());
+      sb.add('  }\n');
+    }
+
+    // --- update: shader time uniforms ---
+    var updBody:String = bodyOf('update');
+    if (updBody != '')
+    {
+      var ulines:Array<String> = updBody.split('\n');
+      for (ul in ulines)
+      {
+        var u:String = StringTools.trim(ul);
+        if (u.indexOf('.iTime = ') >= 0 || u.indexOf('iTime') >= 0)
+        {
+          var dotIdx:Int = u.indexOf('.iTime');
+          if (dotIdx > 0)
+          {
+            var shVar:String = StringTools.trim(u.substring(0, dotIdx));
+            updateCode.add('    if (' + shVar + ' != null) ' + shVar + '.setFloat("iTime", iTimeAccum);\n');
+            if (updateCode.length > 0) updated = true;
+          }
+        }
+      }
+    }
+    if (updated)
+    {
+      sb.add('  var iTimeAccum:Float = 0;\n');
+      sb.add('  function onUpdate(event):Void\n');
+      sb.add('  {\n');
+      sb.add('    super.onUpdate(event);\n');
+      sb.add('    iTimeAccum += event.elapsed;\n');
+      sb.add(updateCode.toString());
+      sb.add('  }\n');
+    }
+
+    // --- Assemble onCreate (shaders + overlays) ---
+    if (extraOnCreate.length > 0)
+    {
+      sb.add('  function onCreate(event):Void\n');
+      sb.add('  {\n');
+      sb.add('    super.onCreate(event);\n');
+      sb.add(extraOnCreate.toString());
+      sb.add('    this.refresh();\n');
+      sb.add('  }\n');
+    }
+
+    // Warning for unhandled CustomShader references
+    if (uniqueShaders.length == 0 && shaderVars.length > 0)
+    {
+      util.warn('Codename: stage "$stageId" script uses shaders not embedded (' + shaderVars.join(', ') + ')');
+    }
+
+    if (warnings.length > 0)
+    {
+      var w:Array<String> = [];
+      for (warn in warnings) w.push(warn);
+      util.warn('Codename: stage "$stageId" script: ' + w.join('; '));
+    }
+
+    var result:String = sb.toString();
+    return result;
+  }
+
+  // Count occurrences of a char in a string.
+  function countChar(s:String, c:String):Int
+  {
+    var n:Int = 0;
+    var idx:Int = 0;
+    while (true)
+    {
+      idx = s.indexOf(c, idx);
+      if (idx < 0) break;
+      n++;
+      idx += c.length;
+    }
+    return n;
+  }
+
+  // Extract function name from a Haxe function declaration line.
+  function extractFnName(line:String):String
+  {
+    var fnIdx:Int = line.indexOf('function ');
+    if (fnIdx < 0) return '';
+    var rest:String = line.substring(fnIdx + 'function '.length);
+    var name:String = '';
+    for (i in 0...rest.length)
+    {
+      var ch:String = rest.charAt(i);
+      if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_')
+      {
+        name += ch;
+      }
+      else break;
+    }
+    return name;
+  }
+
+  // Strip single/double quotes from a string literal.
+  function stripQuotes(s:String):String
+  {
+    if (s.length >= 2 && (s.charAt(0) == '"' || s.charAt(0) == "'"))
+    {
+      return s.substring(1, s.length - 1);
+    }
+    return s;
+  }
+
+  // Translate Codename stage references to V-Slice equivalents.
+  function mapStageRef(ref:String, stageId:String):String
+  {
+    ref = StringTools.trim(ref);
+    // stage.stageSprites["name"] / stage.stageSprites[name]
+    if (ref.indexOf('stage.stageSprites') >= 0)
+    {
+      var br1:Int = ref.indexOf('[');
+      var br2:Int = ref.indexOf(']');
+      if (br1 >= 0 && br2 > br1)
+      {
+        var key:String = StringTools.trim(ref.substring(br1 + 1, br2));
+        key = stripQuotes(key);
+        return 'getNamedProp("' + key + '")';
+      }
+    }
+    switch (ref)
+    {
+      case 'boyfriend' | 'bf' | 'player':
+        return 'getBoyfriend()';
+      case 'dad' | 'opponent':
+        return 'getDad()';
+      case 'gf' | 'girlfriend':
+        return 'getGirlfriend()';
+      case 'bg':
+        return 'getNamedProp("bg")';
+    }
+    return ref;
+  }
+
+  // Translate Paths.image('...') to funkin.Paths.image('...') and similar.
+  function translatePaths(s:String):String
+  {
+    var result:String = StringTools.replace(s, 'Paths.image(', 'funkin.Paths.image(');
+    result = StringTools.replace(result, 'Paths.script(', 'funkin.Paths.script(');
+    // stage.stageSprites["x"] -> getNamedProp("x")
+    if (result.indexOf('stage.stageSprites') >= 0)
+    {
+      var br1:Int = result.indexOf('[');
+      var br2:Int = result.indexOf(']');
+      if (br1 >= 0 && br2 > br1)
+      {
+        var key:String = StringTools.trim(result.substring(br1 + 1, br2));
+        key = stripQuotes(key);
+        result = StringTools.replace(result, result.substring(Math.max(0, result.indexOf('stage.stageSprites')), br2 + 1), 'getNamedProp("' + key + '")');
+      }
+    }
+    result = StringTools.replace(result, 'state.members.indexOf', 'this.members.indexOf');
+    return result;
+  }
+
+  // Build the runtime config object consumed by FunkyCompatDynStage:
+  // raw XML anchors per slot plus portable FX extracted from the stage's
+  // .hx script (shaders, overlays, beat bounces). Everything in memory.
+  public function buildDynCfg(dir:String, stageId:String, baseId:String, xmlText:String):Dynamic
+  {
+    var fx:Dynamic = extractDynFX(dir, stageId, baseId);
+    var charTagToSlot:Dynamic = {girlfriend: 'gf', boyfriend: 'bf', dad: 'dad'};
+    var bodies:Dynamic = {};
+    var ordered:Array<Dynamic> = orderedTags(xmlText, ['boyfriend', 'girlfriend', 'dad']);
+    for (entry in ordered)
+    {
+      var tagName:String = Std.string(get(entry, 'name'));
+      var slot:Dynamic = get(charTagToSlot, tagName);
+      if (slot != null)
+      {
+        var body:String = Std.string(get(entry, 'body'));
+        set(bodies, Std.string(slot), body);
+      }
+    }
+
+    var hints:Dynamic = get(stageCharHints, stageId);
+    var cfg:Dynamic = {};
+    var slots:Array<String> = ['bf', 'dad', 'gf'];
+    for (si in 0...slots.length)
+    {
+      var key:String = slots[si];
+      var body:String = Std.string(get(bodies, key));
+      if (body == 'null') body = '';
+      var defX:Float = key == 'bf' ? 770 : (key == 'dad' ? 100 : 400);
+      var defY:Float = key == 'bf' ? 100 : (key == 'dad' ? 100 : 130);
+      var defScroll:Float = key == 'gf' ? 0.95 : 1;
+      var x:Float = floatAttr(body, 'x', defX);
+      var y:Float = floatAttr(body, 'y', defY);
+      var sxRaw:String = attr(body, 'scalex');
+      var scale:Float = 1;
+      if (sxRaw != null && sxRaw != '')
+      {
+        scale = Std.parseFloat(sxRaw);
+        if (scale == null) scale = 1;
+      }
+      else
+      {
+        scale = floatAttr(body, 'scale', 1);
+      }
+      var scroll:Float = floatAttr(body, 'scroll', defScroll);
+      var camX:Float = floatAttr(body, 'camxoffset', floatAttr(body, 'camx', 0));
+      var camY:Float = floatAttr(body, 'camyoffset', floatAttr(body, 'camy', 0));
+
+      var hint:String = '';
+      if (hints != null) hint = Std.string(get(hints, key));
+      if (hint == null) hint = '';
+      var m:Dynamic = hint != '' ? get(charMetrics, hint) : null;
+      if (m == null && hint != '')
+      {
+        m = nativeCharMetrics(hint);
+        if (m != null) set(charMetrics, hint, m);
+      }
+      var fudge:Float = key == 'dad' ? 150 : -100;
+
+      var slotCfg:Dynamic = {
+        x: x,
+        y: y,
+        scale: scale,
+        scroll: scroll,
+        camX: camX,
+        camY: camY,
+        rootX: m != null ? util.getFloat(get(m, 'ox'), 0) : 0,
+        rootY: m != null ? util.getFloat(get(m, 'oy'), 0) : 0,
+        s: m != null ? util.getFloat(get(m, 's'), 1) : 1,
+        op: m != null && util.getBool(get(m, 'op'), false),
+        fudge: fudge,
+        shader: get(fx.charShader, key)
+      };
+      set(cfg, key, slotCfg);
+    }
+    set(cfg, 'overlays', fx.overlays);
+    set(cfg, 'scrolls', fx.scrolls);
+    set(cfg, 'stepFx', fx.stepFx);
+    set(cfg, 'hideProps', fx.hideProps);
+    set(cfg, 'callEvents', get(stageCallEvents, stageId));
+    set(cfg, 'callActions', fx.callActions);
+    set(cfg, 'scriptSprites', fx.scriptSprites);
+    set(cfg, 'beatModes', fx.beatModes);
+    set(cfg, 'dynamicProps', fx.dynamicProps);
+    set(cfg, 'stageAssetRoot', 'stages/$stageId');
+    set(cfg, 'modelTransform', fx.modelTransform);
+    // Fake-3D tuning knobs from layer config.
+    var lcfg:Dynamic = getLayerConfig();
+    var fy:Float = util.getFloat(get(lcfg, 'fake3dGroundY'), 0);
+    if (fy > 0) set(cfg, 'fake3dY', fy);
+    var fz:Float = util.getFloat(get(lcfg, 'fake3dZoom'), 0);
+    if (fz > 0) set(cfg, 'fake3dZoom', fz);
+    // Parse the stage's 3D model if the script references one.
+    var modelName:String = Std.string(get(fx, 'model'));
+    if (modelName != '' && util.pathExists('mods/$dir/models/$modelName.awd'))
+    {
+      if (three == null) three = new FunkyCompat3D(util);
+      var parsed:Dynamic = three.parse('mods/$dir/models/$modelName.awd', modelName);
+      if (parsed != null)
+      {
+        set(cfg, 'model3d', parsed);
+        trace('[FUNKY-COMPAT-3D] stage "$stageId" model "$modelName": ' + get(parsed, 'meshes').length + ' mesh(es)');
+      }
+    }
+    if (fx.beatBounce != null) set(cfg, 'beatBounce', fx.beatBounce);
+    return cfg;
+  }
+
+  // Extract portable runtime FX from a Codename stage script into a
+  // structured object: {charShader:{bf,dad,gf}, overlays:[], beatBounce}.
+  public function extractDynFX(dir:String, stageId:String, baseId:String):Dynamic
+  {
+    var fx:Dynamic = {charShader: {}, overlays: [], beatBounce: null, scrolls: [], hideProps: [], model: '', modelTransform: {scale: 1, x: 0, y: 0, z: 0, rotationY: 0}, stepFx: [], callActions: {}, beatModes: [], dynamicProps: []};
+    var scriptText:String = stageScriptText(dir, stageId);
+    if ((scriptText == null || scriptText == '') && baseId != null && baseId != '' && baseId != stageId)
+    {
+      // Namespaced id (cross-mod collision): the companion .hx keeps the
+      // ORIGINAL base name (stage.xml + stage.hx).
+      scriptText = stageScriptText(dir, baseId);
+    }
+    if (scriptText == null || scriptText == '') return fx;
+    var lines:Array<String> = scriptText.split('\n');
+
+    // Codename stage scripts often implement a perspective floor in
+    // postUpdate by assigning prop.skew.x and prop.scale.y from camera scroll,
+    // prop.getMidpoint(), and prop.width/height. Preserve that behavior as a
+    // generic descriptor; the runtime evaluates the known camera transform
+    // without depending on the prop's or mod's name.
+    var perspectiveTargets:Dynamic = {};
+    for (rawDynamic in lines)
+    {
+      var dynamicLine:String = StringTools.trim(rawDynamic);
+      var dynamicDot:Int = dynamicLine.indexOf('.skew.x =');
+      if (dynamicDot < 1) dynamicDot = dynamicLine.indexOf('.scale.y =');
+      if (dynamicDot < 1) continue;
+      if (dynamicLine.indexOf('FlxG.camera.scroll') < 0 || dynamicLine.indexOf('getMidpoint') < 0) continue;
+      var dynamicTarget:String = StringTools.trim(dynamicLine.substring(0, dynamicDot));
+      if (dynamicTarget != '') set(perspectiveTargets, dynamicTarget, true);
+    }
+    for (dynamicTargetName in ReflectUtil.fields(perspectiveTargets))
+      get(fx, 'dynamicProps').push({target: dynamicTargetName, cameraPerspective: true});
+
+    var extractedStepFx:Array<Dynamic> = [];
+    var inStepHit:Bool = false;
+    var stepDepth:Int = 0;
+    var currentStepFx:Dynamic = null;
+    for (stepLineRaw in lines)
+    {
+      var stepLine:String = StringTools.trim(stepLineRaw);
+      if (stepLine.indexOf('function stepHit') == 0)
+      {
+        inStepHit = true;
+        stepDepth = countChar(stepLine, '{') - countChar(stepLine, '}');
+        if (stepDepth <= 0) stepDepth = 1;
+        continue;
+      }
+      if (!inStepHit) continue;
+      var stepIf:Int = stepLine.indexOf('curStep ==');
+      if (stepIf >= 0)
+      {
+        var stepText:String = StringTools.trim(stepLine.substring(stepIf + 10));
+        var stepEnd:Int = 0;
+        while (stepEnd < stepText.length && stepText.charCodeAt(stepEnd) >= 48 && stepText.charCodeAt(stepEnd) <= 57) stepEnd++;
+        var parsedStep:Null<Int> = Std.parseInt(stepText.substring(0, stepEnd));
+        if (parsedStep != null)
+        {
+          currentStepFx = {step: parsedStep, kind: '', images: []};
+          extractedStepFx.push(currentStepFx);
+        }
+      }
+      if (currentStepFx != null)
+      {
+        if (stepLine.indexOf('makeGraphic(') >= 0 && stepLine.indexOf('FlxColor.BLACK') >= 0)
+        {
+          if (get(currentStepFx, 'kind') == '') set(currentStepFx, 'kind', 'flash');
+        }
+        if (stepLine.indexOf('loadGraphic(Paths.image(') >= 0)
+        {
+          var iq:Int = stepLine.indexOf("'");
+          var iquote:String = "'";
+          var iq2:Int = stepLine.indexOf('"');
+          if (iq2 >= 0 && (iq < 0 || iq2 < iq)) { iq = iq2; iquote = '"'; }
+          var ie:Int = iq < 0 ? -1 : stepLine.indexOf(iquote, iq + 1);
+          if (ie > iq)
+          {
+            var imagePath:String = stepLine.substring(iq + 1, ie);
+            if (StringTools.startsWith(imagePath, 'stages/$baseId')) imagePath = 'stages/$stageId' + imagePath.substring(('stages/$baseId').length);
+            get(currentStepFx, 'images').push(imagePath);
+            set(currentStepFx, 'kind', 'cinematic');
+          }
+        }
+        if (stepLine.indexOf('defaultCamZoom') >= 0)
+        {
+          set(currentStepFx, 'kind', 'zoom');
+          var zoomEq:Int = stepLine.indexOf('=');
+          if (zoomEq >= 0) set(currentStepFx, 'zoom', Std.parseFloat(StringTools.trim(stepLine.substring(zoomEq + 1))));
+        }
+        if (stepLine.indexOf('FlxTween.tween(') >= 0) set(currentStepFx, 'kind', 'fade');
+        if (stepLine.indexOf('makeGraphic(') >= 0 && get(currentStepFx, 'kind') == '') set(currentStepFx, 'kind', 'cinematic');
+      }
+      stepDepth += countChar(stepLine, '{') - countChar(stepLine, '}');
+      if (stepDepth <= 0) { inStepHit = false; currentStepFx = null; }
+    }
+    set(fx, 'stepFx', extractedStepFx);
+
+    var callActions:Dynamic = get(fx, 'callActions');
+    var activeFunction:String = '';
+    var functionDepth:Int = 0;
+
+    // Extract simple, safe function actions. Arbitrary Codename HScript is
+    // not executable in V-Slice, but direct sprite property/animation calls
+    // are portable and can be replayed from chart HScript Call events.
+    for (rawActionLine in lines)
+    {
+      var actionLine:String = StringTools.trim(rawActionLine);
+      if (actionLine.indexOf('function ') == 0)
+      {
+        var fnStart:Int = 9;
+        var fnOpen:Int = actionLine.indexOf('(', fnStart);
+        if (fnOpen > fnStart) activeFunction = StringTools.trim(actionLine.substring(fnStart, fnOpen));
+        functionDepth = countChar(actionLine, '{') - countChar(actionLine, '}');
+        continue;
+      }
+      if (activeFunction == '') continue;
+      functionDepth += countChar(actionLine, '{') - countChar(actionLine, '}');
+      if (actionLine.indexOf('.visible') >= 0 && actionLine.indexOf('=') >= 0)
+      {
+        var visEq:Int = actionLine.indexOf('=');
+        var visDot:Int = actionLine.indexOf('.visible');
+        var visTarget:String = StringTools.trim(actionLine.substring(0, visDot));
+        var visValue:String = StringTools.trim(actionLine.substring(visEq + 1));
+        if (visValue.charAt(visValue.length - 1) == ';') visValue = StringTools.trim(visValue.substring(0, visValue.length - 1));
+        if (visTarget != '' && (visValue == 'true' || visValue == 'false'))
+        {
+          var visActions:Array<Dynamic> = get(callActions, activeFunction);
+          if (visActions == null) visActions = [];
+          visActions.push({op: 'visible', target: visTarget, value: visValue == 'true'});
+          set(callActions, activeFunction, visActions);
+        }
+      }
+      var playIdx:Int = actionLine.indexOf('.animation.play(');
+      if (playIdx >= 0)
+      {
+        var playOpen:Int = actionLine.indexOf('(', playIdx);
+        var playClose:Int = actionLine.indexOf(',', playOpen);
+        if (playClose < 0) playClose = actionLine.indexOf(')', playOpen);
+        if (playOpen >= 0 && playClose > playOpen)
+        {
+          var playTarget:String = StringTools.trim(actionLine.substring(0, playIdx));
+          var animName:String = stripQuotes(StringTools.trim(actionLine.substring(playOpen + 1, playClose)));
+          if (playTarget != '' && animName != '')
+          {
+            var playActions:Array<Dynamic> = get(callActions, activeFunction);
+            if (playActions == null) playActions = [];
+            playActions.push({op: 'playAnim', target: playTarget, value: animName});
+            set(callActions, activeFunction, playActions);
+          }
+        }
+      }
+      if (functionDepth <= 0) activeFunction = '';
+    }
+
+    // Generic script-created sprites. This captures the common Codename
+    // pattern used for background actors without naming a mod, stage, or
+    // atlas in the compatibility runtime.
+    var scriptSprites:Array<Dynamic> = [];
+    var loopCount:Int = 1;
+    var loopStepX:Float = 0;
+    var loopStepY:Float = 0;
+    for (spriteRaw in lines)
+    {
+      var spriteLine:String = StringTools.trim(spriteRaw);
+      if (spriteLine.indexOf('for (') == 0 && spriteLine.indexOf('...') >= 0)
+      {
+        var dots:Int = spriteLine.indexOf('...');
+        var end:Int = dots + 3;
+        while (end < spriteLine.length && spriteLine.charCodeAt(end) >= 48 && spriteLine.charCodeAt(end) <= 57) end++;
+        var parsedCount:Null<Int> = Std.parseInt(spriteLine.substring(dots + 3, end));
+        if (parsedCount != null) loopCount = parsedCount;
+      }
+      var newIdx:Int = spriteLine.indexOf('new FlxSprite(');
+      if (newIdx >= 0)
+      {
+        var eq:Int = spriteLine.indexOf('=');
+        if (eq < 0) continue;
+        var varName:String = '';
+        var varIdx:Int = spriteLine.indexOf('var ');
+        if (varIdx >= 0 && varIdx < eq)
+          varName = StringTools.trim(spriteLine.substring(varIdx + 4, eq));
+        else
+          varName = StringTools.trim(spriteLine.substring(0, eq));
+        var colon:Int = varName.indexOf(':');
+        if (colon > 0) varName = StringTools.trim(varName.substring(0, colon));
+        if (varName == '' || varName == 'if') continue;
+        var open:Int = spriteLine.indexOf('(', newIdx);
+        // Position arguments may contain nested parentheses, e.g.
+        // `-100 + (i * 180)`. Use the call's final close paren.
+        var close:Int = spriteLine.lastIndexOf(')');
+
+        var xVal:Float = 0;
+        var yVal:Float = 0;
+        var stepX:Float = 0;
+        var stepY:Float = 0;
+        if (open >= 0 && close > open)
+        {
+          var argsText:String = spriteLine.substring(open + 1, close);
+          var comma:Int = argsText.indexOf(',');
+          if (comma >= 0)
+          {
+            var xText:String = StringTools.trim(argsText.substring(0, comma));
+            var yText:String = StringTools.trim(argsText.substring(comma + 1));
+            xVal = screenNumOr(xText, 0);
+            yVal = screenNumOr(yText, 0);
+            // Handle loop-position expressions such as
+            // `-100 + (i * 180)` without evaluating the loop variable.
+            var plus:Int = xText.indexOf('+');
+            if (plus > 0) xVal = numOr(xText.substring(0, plus), xVal);
+            plus = yText.indexOf('+');
+            if (plus > 0) yVal = numOr(yText.substring(0, plus), yVal);
+            var mul:Int = xText.indexOf('*');
+            if (mul >= 0) stepX = numOr(xText.substring(mul + 1), 0);
+            mul = yText.indexOf('*');
+            if (mul >= 0) stepY = numOr(yText.substring(mul + 1), 0);
+          }
+        }
+        scriptSprites.push({varName: varName, x: xVal, y: yVal, stepX: stepX, stepY: stepY, count: loopCount, scaleX: 1, scaleY: 1, antialiasing: true, atlas: '', anim: '', prefix: '', frame: -1, fps: 24, before: '', z: 150});
+        continue;
+      }
+      if (scriptSprites.length == 0) continue;
+      var last:Dynamic = scriptSprites[scriptSprites.length - 1];
+      var lastName:String = Std.string(get(last, 'varName'));
+      if (lastName == null || lastName == 'null' || lastName == '') continue;
+      if (spriteLine.indexOf(lastName + '.frames = Paths.getSparrowAtlas(') >= 0)
+      {
+        var aq:Int = spriteLine.indexOf("'", spriteLine.indexOf('getSparrowAtlas'));
+        var quote:String = "'";
+        var aq2:Int = spriteLine.indexOf('"', spriteLine.indexOf('getSparrowAtlas'));
+        if (aq2 >= 0 && (aq < 0 || aq2 < aq)) { aq = aq2; quote = '"'; }
+        var ae:Int = aq < 0 ? -1 : spriteLine.indexOf(quote, aq + 1);
+        if (ae > aq)
+        {
+          var atlas:String = spriteLine.substring(aq + 1, ae);
+          if (StringTools.startsWith(atlas, 'stages/$baseId')) atlas = 'stages/$stageId' + atlas.substring(('stages/$baseId').length);
+          set(last, 'atlas', atlas);
+        }
+      }
+      var prefixIdx:Int = spriteLine.indexOf('.animation.addByPrefix(');
+      if (prefixIdx >= 0)
+      {
+        var qA:Int = spriteLine.indexOf("'", prefixIdx);
+        var qB:Int = qA < 0 ? -1 : spriteLine.indexOf("'", qA + 1);
+        var qC:Int = qB < 0 ? -1 : spriteLine.indexOf("'", qB + 1);
+        var qD:Int = qC < 0 ? -1 : spriteLine.indexOf("'", qC + 1);
+        if (qD > qC)
+        {
+          set(last, 'anim', spriteLine.substring(qA + 1, qB));
+          set(last, 'prefix', spriteLine.substring(qC + 1, qD));
+          var randomIdx:Int = spriteLine.indexOf('FlxG.random.int(');
+          if (randomIdx >= 0)
+          {
+            set(last, 'randomFrames', true);
+            var randomOpen:Int = spriteLine.indexOf('(', randomIdx);
+            var randomClose:Int = spriteLine.indexOf(')', randomOpen);
+            if (randomClose > randomOpen)
+            {
+              var randomParts:Array<String> = spriteLine.substring(randomOpen + 1, randomClose).split(',');
+              if (randomParts.length > 1)
+              {
+                var randomMin:Float = numOr(randomParts[0], 0);
+                var randomMax:Float = numOr(randomParts[1], 0);
+                set(last, 'randomMin', randomMin);
+                set(last, 'randomMax', randomMax);
+                var atlasForRandom:String = Std.string(get(last, 'atlas'));
+                var prefixForRandom:String = Std.string(get(last, 'prefix'));
+                if (atlasForRandom != null && atlasForRandom != 'null' && atlasForRandom != '' && prefixForRandom != null && prefixForRandom != 'null')
+                {
+                  var atlasXml:String = util.readText('mods/$dir/images/$atlasForRandom.xml');
+                  if (atlasXml == null && StringTools.startsWith(atlasForRandom, 'stages/$stageId'))
+                    atlasXml = util.readText('mods/$dir/images/stages/$baseId' + atlasForRandom.substring(('stages/$stageId').length) + '.xml');
+                  if (atlasXml != null && atlasXml.indexOf('name="' + prefixForRandom + Std.int(randomMin) + '"') < 0
+                    && atlasXml.indexOf('name="' + prefixForRandom + Std.int(randomMin + 1) + '"') >= 0)
+                    set(last, 'randomOffset', 1);
+                }
+              }
+            }
+          }
+        }
+      }
+      if (spriteLine.indexOf(lastName + '.scale.set(') >= 0)
+      {
+        var so:Int = spriteLine.indexOf('(', spriteLine.indexOf(lastName + '.scale.set'));
+        var sc:Int = spriteLine.indexOf(')', so);
+        if (so >= 0 && sc > so)
+        {
+          var parts:Array<String> = spriteLine.substring(so + 1, sc).split(',');
+          if (parts.length > 0) set(last, 'scaleX', numOr(parts[0], 1));
+          if (parts.length > 1) set(last, 'scaleY', numOr(parts[1], 1));
+        }
+      }
+      var insertIdx:Int = spriteLine.indexOf('insert(members.indexOf(');
+      if (insertIdx >= 0 && spriteLine.indexOf(lastName, insertIdx) >= 0)
+      {
+        var bo:Int = spriteLine.indexOf('indexOf(', insertIdx) + 8;
+        var bc:Int = spriteLine.indexOf(')', bo);
+        if (bc > bo) set(last, 'before', StringTools.trim(spriteLine.substring(bo, bc)));
+      }
+    }
+    set(fx, 'scriptSprites', scriptSprites);
+
+    // Extract the common Codename stateful beat pattern declaratively. This
+    // supports switch(state) cases that set a base pose and an alternating
+    // special pose without depending on a stage or mod name.
+    var beatModes:Dynamic = {};
+    var activeBeatMode:Int = -1;
+    var beatConditional:Bool = false;
+    for (beatRaw in lines)
+    {
+      var beatLine:String = StringTools.trim(beatRaw);
+      if (beatLine.indexOf('case ') == 0 && beatLine.indexOf(':') > 5)
+      {
+        var caseEnd:Int = beatLine.indexOf(':');
+        var parsedCase:Null<Int> = Std.parseInt(StringTools.trim(beatLine.substring(5, caseEnd)));
+        activeBeatMode = parsedCase == null ? -1 : parsedCase;
+        beatConditional = false;
+        if (activeBeatMode >= 0) set(beatModes, Std.string(activeBeatMode), {mode: activeBeatMode, baseX: 1, baseY: 1, baseSet: false, specialX: 1, specialY: 1, specialSet: false, pattern: 'none'});
+      }
+      if (activeBeatMode < 0) continue;
+      var modeCfg:Dynamic = get(beatModes, Std.string(activeBeatMode));
+      if (modeCfg == null) continue;
+      // Only pose-selection conditions should classify the following sprite
+      // assignment as a special pose. Bounds checks such as
+      // `if (beated >= stupidheads.length)` are control flow, not a pose.
+      if ((beatLine.indexOf('if (') == 0 || beatLine.indexOf('if(') == 0)
+        && (beatLine.indexOf('i % 2 == beated') >= 0 || beatLine.indexOf('beated % 2 == 0') >= 0)) beatConditional = true;
+      var scaleIdx:Int = beatLine.indexOf('.scale.set(');
+      if (scaleIdx >= 0)
+      {
+        var so:Int = beatLine.indexOf('(', scaleIdx);
+        var sc:Int = beatLine.indexOf(')', so);
+        if (so >= 0 && sc > so)
+        {
+          var sp:Array<String> = beatLine.substring(so + 1, sc).split(',');
+          if (sp.length >= 2)
+          {
+            var sx:Float = numOr(sp[0], 1); var sy:Float = numOr(sp[1], 1);
+            var special:Bool = beatLine.indexOf('[beated]') >= 0 || beatConditional;
+            if (special) { set(modeCfg, 'specialX', sx); set(modeCfg, 'specialY', sy); set(modeCfg, 'specialSet', true); }
+            else { set(modeCfg, 'baseX', sx); set(modeCfg, 'baseY', sy); set(modeCfg, 'baseSet', true); }
+          }
+        }
+      }
+      if (beatLine.indexOf('.y =') >= 0)
+      {
+        var yeq:Int = beatLine.indexOf('=');
+        var yy:Float = numOr(beatLine.substring(yeq + 1), 0);
+        var specialY:Bool = beatLine.indexOf('[beated]') >= 0 || beatConditional;
+        if (specialY) { set(modeCfg, 'specialYPos', yy); set(modeCfg, 'specialSet', true); }
+        else { set(modeCfg, 'baseYPos', yy); set(modeCfg, 'baseSet', true); }
+      }
+      if (beatLine.indexOf('i % 2 == beated') >= 0) set(modeCfg, 'pattern', 'indexParity');
+      else if (beatLine.indexOf('beated % 2 == 0') >= 0) set(modeCfg, 'pattern', 'beatParity');
+      else if (beatLine.indexOf('[beated]') >= 0) set(modeCfg, 'pattern', 'sequence');
+    }
+    for (modeKey in ReflectUtil.fields(beatModes))
+    {
+      var modeOut:Dynamic = get(beatModes, modeKey);
+      if (modeOut != null && get(modeOut, 'baseSet') == true) get(fx, 'beatModes').push(modeOut);
+    }
+
+    // name -> {frag, uniforms{}
+    var shaders:Dynamic = {};
+    var shaderNames:Array<String> = [];
+    // overlay sprite vars, in creation order
+    var ovOrder:Array<String> = [];
+    var ovs:Dynamic = {};
+    var curSection:String = '';
+    var depth:Int = 0;
+
+    for (li in 0...lines.length)
+    {
+      var line:String = StringTools.trim(lines[li]);
+      if (line.indexOf('function ') == 0)
+      {
+        if (line.indexOf('beatHit') >= 0) curSection = 'beat';
+        else if (line.indexOf('stepHit') >= 0) curSection = 'step';
+        else curSection = 'other';
+        continue;
+      }
+      if (line == '') continue;
+      // Portable stepHit effects. Keep the extraction generic: the runtime
+      // decides how to render the recognized effect rather than replaying raw
+      // Codename HScript against V-Slice-only objects.
+
+      // NOTE: use3D blocks are NOT skipped - GUNLICK's global.hx defaults
+      // enable3D to TRUE, so those blocks describe the mod's default look
+      // (character grading, parallax scroll factors). Non-portable lines
+      // inside them (Flx3DView etc.) simply match no handler and drop out.
+      var oc:Int = countChar(line, '{');
+      var cc:Int = countChar(line, '}');
+      depth += oc - cc;
+
+      // Shader declarations.
+      var csIdx:Int = line.indexOf('new CustomShader(');
+      if (csIdx >= 0)
+      {
+        var open:Int = line.indexOf('(', csIdx);
+        var close:Int = line.indexOf(')', open);
+        if (open >= 0 && close > open)
+        {
+          var frag:String = stripQuotes(StringTools.trim(line.substring(open + 1, close)));
+          var eqIdx:Int = line.indexOf('=');
+          if (frag != '' && eqIdx > 0 && line.indexOf('var ') >= 0)
+          {
+            var vName:String = StringTools.trim(line.substring(line.indexOf('var ') + 4, eqIdx));
+            var colon:Int = vName.indexOf(':');
+            if (colon > 0) vName = StringTools.trim(vName.substring(0, colon));
+            if (vName != '') { set(shaders, vName, {frag: frag, uniforms: []}); shaderNames.push(vName); }
+          }
+        }
+        continue;
+      }
+
+      // Shader uniform assignments: X.k = number;
+      var matchedUniform:Bool = false;
+      for (sn in shaderNames)
+      {
+        if (StringTools.startsWith(line, sn + '.'))
+        {
+          var eqI:Int = line.indexOf('=');
+          if (eqI > 0 && line.indexOf('==') != eqI)
+          {
+            var uName:String = StringTools.trim(line.substring(sn.length + 1, eqI));
+            var uVal:Float = Std.parseFloat(StringTools.trim(line.substring(eqI + 1)));
+            if (!Math.isNaN(uVal))
+            {
+              get(get(shaders, sn), 'uniforms').push({k: uName, v: uVal});
+              matchedUniform = true;
+            }
+          }
+          break;
+        }
+      }
+      if (matchedUniform) continue;
+
+      // Character shader assignment (possibly chained):
+      // boyfriend.shader = dad.shader = gf.shader = shvar;
+      if (line.indexOf('.shader') >= 0 && line.indexOf('=') >= 0 && line.indexOf('new CustomShader') < 0)
+      {
+        var eqE:Int = line.lastIndexOf('=');
+        var rhs:String = StringTools.trim(line.substring(eqE + 1));
+        if (rhs.charAt(rhs.length - 1) == ';') rhs = StringTools.trim(rhs.substring(0, rhs.length - 1));
+        if (get(shaders, rhs) != null)
+        {
+          var lhsPart:String = StringTools.trim(line.substring(0, eqE));
+          var segs:Array<String> = lhsPart.split('=');
+          var matchedSlot:Bool = false;
+          for (seg in segs)
+          {
+            var segT:String = StringTools.trim(seg);
+            var dot:Int = segT.indexOf('.shader');
+            if (dot <= 0) continue;
+            var target:String = StringTools.trim(segT.substring(0, dot));
+            var slot:String = '';
+            if (target == 'boyfriend' || target == 'bf' || target == 'player') slot = 'bf';
+            else if (target == 'dad' || target == 'opponent') slot = 'dad';
+            else if (target == 'gf' || target == 'girlfriend') slot = 'gf';
+            if (slot != '')
+            {
+              set(get(fx, 'charShader'), slot, get(shaders, rhs));
+              matchedSlot = true;
+            }
+          }
+          // Only swallow the line when a CHARACTER got the shader; overlay
+          // '.shader =' lines must fall through to the overlay handler.
+          if (matchedSlot) continue;
+        }
+      }
+
+      // Beat bounce parameters.
+      if (curSection == 'beat')
+      {
+        if (line.indexOf('dropAmount') >= 0 && line.indexOf('=') >= 0)
+        {
+          var dv:Float = Std.parseFloat(StringTools.trim(line.substring(line.indexOf('=') + 1)));
+          if (!Math.isNaN(dv))
+          {
+            if (fx.beatBounce == null) fx.beatBounce = {drop: dv, dur: 0.3, count: 4, prefix: 'crowd'};
+            else set(fx.beatBounce, 'drop', dv);
+          }
+        }
+        if (line.indexOf('durationUp') >= 0 && line.indexOf('=') >= 0)
+        {
+          var du:Float = Std.parseFloat(StringTools.trim(line.substring(line.indexOf('=') + 1)));
+          if (!Math.isNaN(du) && fx.beatBounce != null) set(fx.beatBounce, 'dur', du);
+        }
+        var forIdx:Int = line.indexOf('in 1...');
+        if (forIdx >= 0)
+        {
+          var cntStr:String = StringTools.trim(line.substring(forIdx + 7));
+          var endNum:Int = 0;
+          while (endNum < cntStr.length)
+          {
+            var cCode:Int = cntStr.charCodeAt(endNum);
+            if (cCode < 48 || cCode > 57) break;
+            endNum++;
+          }
+          var cnt:Int = Std.parseInt(cntStr.substring(0, endNum));
+          if (cnt != null && cnt > 0 && fx.beatBounce != null) set(fx.beatBounce, 'count', cnt);
+        }
+        continue;
+      }
+
+      // Overlay sprites created in create/postCreate.
+      if (line.indexOf('new FlxSprite(') >= 0 && line.indexOf('var ') >= 0)
+      {
+        var eqO:Int = line.indexOf('=');
+        if (eqO > 0)
+        {
+          var ovName:String = StringTools.trim(line.substring(line.indexOf('var ') + 4, eqO));
+          var colon2:Int = ovName.indexOf(':');
+          if (colon2 > 0) ovName = StringTools.trim(ovName.substring(0, colon2));
+          var openP:Int = line.indexOf('(', line.indexOf('new FlxSprite'));
+          var closeP:Int = line.indexOf(')', openP);
+          var ox:Float = 0;
+          var oy:Float = 0;
+          if (openP >= 0 && closeP > openP)
+          {
+            var args:String = line.substring(openP + 1, closeP);
+            var comma:Int = args.indexOf(',');
+            if (comma > 0)
+            {
+              ox = screenNumOr(args.substring(0, comma), 0);
+              oy = screenNumOr(args.substring(comma + 1), 0);
+            }
+          }
+          if (ovName != '')
+          {
+            var ov:Dynamic = {x: ox, y: oy, w: 1, h: 1, color: '4294967295', scaleX: 1, scaleY: 1, scrollX: 0, scrollY: 0, angle: 0, alpha: 1, blend: '', z: 5000, added: false};
+            set(ovs, ovName, ov);
+            ovOrder.push(ovName);
+          }
+        }
+        continue;
+      }
+
+      // Scroll-factor overrides (apply3DScrollFactors-style parallax):
+      // <ref>.scrollFactor.set(a, b) where ref is a character slot or a
+      // named stage prop (stage.stageSprites["name"]). Lines owned by
+      // script-created overlay vars fall through to the overlay handler.
+      if (line.indexOf('.visible = false') >= 0)
+      {
+        var visOwner:String = StringTools.trim(line.substring(0, line.indexOf('.visible')));
+        var vTarget:String = '';
+        var vsIdx:Int = visOwner.indexOf('stage.stageSprites[');
+        if (vsIdx >= 0)
+        {
+          var vqA:Int = visOwner.indexOf('"');
+          var vqB:Int = visOwner.indexOf('"', vqA + 1);
+          if (vqA >= 0 && vqB > vqA) vTarget = visOwner.substring(vqA + 1, vqB);
+        }
+        else if (visOwner == 'bg') vTarget = 'bg';
+        if (vTarget != '') get(fx, 'hideProps').push(vTarget);
+        continue;
+      }
+      if (line.indexOf('.asset.scale(') >= 0 || line.indexOf('.asset.x =') >= 0 || line.indexOf('.asset.y =') >= 0 || line.indexOf('.asset.z =') >= 0 || line.indexOf('.asset.rotationY =') >= 0)
+      {
+        var modelTransform:Dynamic = get(fx, 'modelTransform');
+        if (line.indexOf('.asset.scale(') >= 0)
+        {
+          var msOpen:Int = line.indexOf('(', line.indexOf('.asset.scale'));
+          var msClose:Int = line.indexOf(')', msOpen);
+          if (msOpen >= 0 && msClose > msOpen) set(modelTransform, 'scale', numOr(line.substring(msOpen + 1, msClose), 1));
+        }
+        else
+        {
+          var eq:Int = line.indexOf('=');
+          var value:String = eq >= 0 ? line.substring(eq + 1) : '';
+          if (line.indexOf('.asset.x =') >= 0) set(modelTransform, 'x', numOr(value, 0));
+          else if (line.indexOf('.asset.y =') >= 0) set(modelTransform, 'y', numOr(value, 0));
+          else if (line.indexOf('.asset.z =') >= 0) set(modelTransform, 'z', numOr(value, 0));
+          else if (line.indexOf('.asset.rotationY =') >= 0) set(modelTransform, 'rotationY', numOr(value, 0));
+        }
+        continue;
+      }
+      if (line.indexOf('addModel(Paths.awd(') >= 0 || line.indexOf('addModel(Paths.awd (') >= 0)
+      {
+        var awdOpen:Int = line.indexOf("'");
+        var awdQ:String = "'";
+        var awdAlt:Int = line.indexOf('"');
+        if (awdAlt >= 0 && (awdOpen < 0 || awdAlt < awdOpen)) { awdOpen = awdAlt; awdQ = '"'; }
+        if (awdOpen >= 0)
+        {
+          var awdEnd:Int = line.indexOf(awdQ, awdOpen + 1);
+          if (awdEnd > awdOpen) set(fx, 'model', line.substring(awdOpen + 1, awdEnd));
+        }
+        continue;
+      }
+      if (line.indexOf('.scrollFactor.set(') >= 0)
+      {
+        var sfOwn:String = StringTools.trim(line.substring(0, line.indexOf('.scrollFactor')));
+        if (get(ovs, sfOwn) == null)
+        {
+          var sfOpen2:Int = line.indexOf('(');
+          var sfClose:Int = line.lastIndexOf(')');
+          if (sfOpen2 >= 0 && sfClose > sfOpen2)
+          {
+            var sfArgs:String = line.substring(sfOpen2 + 1, sfClose);
+            var sfParts:Array<String> = sfArgs.split(',');
+            if (sfParts.length >= 2)
+            {
+              var targetName:String = '';
+              var ssIdx:Int = line.indexOf('stage.stageSprites[');
+              if (ssIdx >= 0)
+              {
+                var qA:Int = line.indexOf('"', ssIdx);
+                var qB:Int = line.indexOf('"', qA + 1);
+                if (qA >= 0 && qB > qA) targetName = line.substring(qA + 1, qB);
+              }
+              else
+              {
+                if (sfOwn == 'boyfriend' || sfOwn == 'bf' || sfOwn == 'player') targetName = 'bf';
+                else if (sfOwn == 'dad' || sfOwn == 'opponent') targetName = 'dad';
+                else if (sfOwn == 'gf' || sfOwn == 'girlfriend') targetName = 'gf';
+                else targetName = sfOwn;
+              }
+              if (targetName != '')
+              {
+                get(fx, 'scrolls').push({target: targetName, x: numOr(sfParts[0], 1), y: numOr(sfParts[1], 1)});
+              }
+            }
+          }
+          continue;
+        }
+      }
+
+      // Overlay sprite lines: X.prop(...)
+      var dotProp:Int = line.indexOf('.');
+      if (dotProp > 0)
+      {
+        var owner:String = StringTools.trim(line.substring(0, dotProp));
+        var ov2:Dynamic = get(ovs, owner);
+        if (ov2 != null)
+        {
+          if (line.indexOf('.makeGraphic(') >= 0)
+          {
+            var mgOpen:Int = line.indexOf('(');
+            var mgArgs:String = line.substring(mgOpen + 1, line.lastIndexOf(')'));
+            var parts:Array<String> = mgArgs.split(',');
+            if (parts.length >= 2)
+            {
+              // FlxG.width/height tokens become sentinels (-1/-2) resolved
+              // against the real screen size at stage-build time.
+              set(ov2, 'w', screenNumOr(parts[0], 1));
+              set(ov2, 'h', screenNumOr(parts[1], 1));
+            }
+            if (parts.length >= 3) set(ov2, 'color', colorToken(parts[2]));
+          }
+          else if (line.indexOf('.loadGraphic(') >= 0)
+          {
+            var q1:Int = line.indexOf("'");
+            var q1b:Int = line.indexOf('"');
+            if (q1b >= 0 && (q1 < 0 || q1b < q1)) q1 = q1b;
+            if (q1 >= 0)
+            {
+              var q2:Int = line.indexOf(line.charAt(q1), q1 + 1);
+              if (q2 > q1) set(ov2, 'image', line.substring(q1 + 1, q2));
+            }
+          }
+          else if (line.indexOf('.blend') >= 0)
+          {
+            var bEq:Int = line.indexOf('=');
+            var bv:String = StringTools.trim(line.substring(bEq + 1));
+            var dotB:Int = bv.lastIndexOf('.');
+            if (dotB >= 0) bv = bv.substring(dotB + 1);
+            if (bv.charAt(bv.length - 1) == ';') bv = bv.substring(0, bv.length - 1);
+            set(ov2, 'blend', bv);
+          }
+          else if (line.indexOf('.shader') >= 0)
+          {
+            var sEq:Int = line.lastIndexOf('=');
+            var sv:String = StringTools.trim(line.substring(sEq + 1));
+            if (sv.charAt(sv.length - 1) == ';') sv = sv.substring(0, sv.length - 1);
+            set(ov2, 'shader', get(shaders, sv));
+          }
+          else if (line.indexOf('.scrollFactor.set(') >= 0)
+          {
+            var sfOpen:Int = line.indexOf('(');
+            var sfArgs:String = line.substring(sfOpen + 1, line.lastIndexOf(')'));
+            var sfParts:Array<String> = sfArgs.split(',');
+            set(ov2, 'scrollX', sfParts.length > 0 ? numOr(sfParts[0], 0) : 0);
+            set(ov2, 'scrollY', sfParts.length > 1 ? numOr(sfParts[1], 0) : 0);
+          }
+          else if (line.indexOf('.scale.set(') >= 0)
+          {
+            var scOpen:Int = line.indexOf('(');
+            var scArgs:String = line.substring(scOpen + 1, line.lastIndexOf(')'));
+            var scParts:Array<String> = scArgs.split(',');
+            set(ov2, 'scaleX', scParts.length > 0 ? numOr(scParts[0], 1) : 1);
+            set(ov2, 'scaleY', scParts.length > 1 ? numOr(scParts[1], 1) : 1);
+          }
+          else if (line.indexOf('.angle') >= 0)
+          {
+            var aEq:Int = line.indexOf('=');
+            set(ov2, 'angle', numOr(line.substring(aEq + 1), 0));
+          }
+          else if (line.indexOf('.alpha') >= 0)
+          {
+            var alEq:Int = line.indexOf('=');
+            set(ov2, 'alpha', numOr(line.substring(alEq + 1), 1));
+          }
+          continue;
+        }
+      }
+
+      // add(X) / insert(_, X) marks the overlay as actually used.
+      if ((StringTools.startsWith(line, 'add(') || line.indexOf('insert(') >= 0) && ovOrder.length > 0)
+      {
+        for (on2 in ovOrder)
+        {
+          if (line.indexOf(on2) >= 0)
+          {
+            var ov3:Dynamic = get(ovs, on2);
+            set(ov3, 'added', true);
+            if (line.indexOf('insert(0') >= 0) set(ov3, 'z', -1000);
+          }
+        }
+        continue;
+      }
+    }
+
+    var outOverlays:Array<Dynamic> = [];
+    for (name in ovOrder)
+    {
+      var ovf:Dynamic = get(ovs, name);
+      if (ovf != null && util.getBool(get(ovf, 'added'), false)) outOverlays.push(ovf);
+    }
+    set(fx, 'overlays', outOverlays);
+    return fx;
+  }
+
+  function numOr(s:String, fallback:Float):Float
+  {
+    var t:String = StringTools.trim(s);
+    if (t.charAt(t.length - 1) == ';') t = StringTools.trim(t.substring(0, t.length - 1));
+    var v:Float = Std.parseFloat(t);
+    if (Math.isNaN(v)) return fallback;
+    return v;
+  }
+
+  // Evaluate the small arithmetic expressions used by Codename fullscreen
+  // overlays. The old importer only accepted literals, so expressions such as
+  // `FlxG.width * 2` became 1x1 sprites and `-FlxG.width / 2` became 0, which
+  // renders a shader as a tiny square at the top-left corner.
+  function screenNumOr(s:String, fallback:Float):Float
+  {
+    var t:String = StringTools.trim(s);
+    if (t.charAt(t.length - 1) == ';') t = StringTools.trim(t.substring(0, t.length - 1));
+    while (t.length >= 2 && t.charAt(0) == '(' && t.charAt(t.length - 1) == ')')
+      t = StringTools.trim(t.substring(1, t.length - 1));
+    t = StringTools.replace(t, 'FlxG.width', Std.string(FlxG.width));
+    t = StringTools.replace(t, 'FlxG.height', Std.string(FlxG.height));
+    t = StringTools.replace(t, ' ', '');
+    // Handle one level of +, -, *, or /. This covers the screen-space
+    // expressions used by stage scripts without executing arbitrary code.
+    var op:Int = -1;
+    for (i in 1...t.length)
+    {
+      var c:String = t.charAt(i);
+      if (c == '+' || c == '-' || c == '*' || c == '/') { op = i; break; }
+    }
+    if (op > 0)
+    {
+      var left:Float = Std.parseFloat(t.substring(0, op));
+      var right:Float = Std.parseFloat(t.substring(op + 1));
+      if (!Math.isNaN(left) && !Math.isNaN(right))
+      {
+        switch (t.charAt(op))
+        {
+          case '+': return left + right;
+          case '-': return left - right;
+          case '*': return left * right;
+          case '/': return right == 0 ? fallback : left / right;
+        }
+      }
+    }
+    var value:Float = Std.parseFloat(t);
+    if (!Math.isNaN(value) && (t != '')) return value;
+    return fallback;
+  }
+
+  // Numeric dimension token; retained for callers that need the old API.
+  function dimToken(s:String):Float
+  {
+    return screenNumOr(s, 1);
+  }
+
+  // Map FlxColor.NAME / 0xAARRGGBB tokens to an int string for makeGraphic.
+  function colorToken(s:String):String
+  {
+    var t:String = StringTools.trim(s);
+    if (t.charAt(t.length - 1) == ';') t = StringTools.trim(t.substring(0, t.length - 1));
+    var named:Dynamic = {WHITE: '4294967295', BLACK: '4278190080', RED: '4294901760', GREEN: '4278255360', BLUE: '4278190335', TRANSPARENT: '0'};
+    if (StringTools.startsWith(t, 'FlxColor.'))
+    {
+      var nm:String = t.substring('FlxColor.'.length);
+      var mapped:Dynamic = get(named, nm);
+      if (mapped != null) return Std.string(mapped);
+      return '4278190080';
+    }
+    if (StringTools.startsWith(t, '0x'))
+    {
+      var v:Null<Int> = Std.parseInt(t);
+      if (v != null) return Std.string(v);
+    }
+    return '4278190080';
   }
 
   function sanitizeClassName(s:String):String
@@ -3042,6 +4775,23 @@ class FunkyCompatCodename
     util.warn('Codename: no weeks found - generated fallback level "$levelId" with ${out.songs.length} song(s)');
   }
 
+  // Registers mod .frag/.vert shaders into the virtual cache so the
+  // generated ScriptedStages can construct FlxRuntimeShaders from them
+  // (V-Slice resolves shaders by Paths.frag -> assets/shaders/<name>.frag).
+  public function sweepShaders(dir:String, out:Dynamic):Void
+  {
+    if (!util.pathExists('mods/$dir/shaders')) return;
+    var files:Array<String> = util.listDir('mods/$dir/shaders');
+    for (f in files)
+    {
+      var lower:String = f.toLowerCase();
+      if (!StringTools.endsWith(lower, '.frag') && !StringTools.endsWith(lower, '.vert')) continue;
+      var text:String = util.readText('mods/$dir/shaders/$f');
+      if (text == null) continue;
+      out.texts.push({paths: util.shaderKeys(f), content: text});
+    }
+  }
+
   // ------------------------------------------------------------------
   // Entry point
   // ------------------------------------------------------------------
@@ -3077,6 +4827,8 @@ class FunkyCompatCodename
     convertStages(dir, out);
     trace('[FUNKY-COMPAT] (codename) $dir: image sweep...');
     sweepImages(dir, out);
+    trace('[FUNKY-COMPAT] (codename) $dir: shaders...');
+    sweepShaders(dir, out);
     trace('[FUNKY-COMPAT] (codename) $dir: done');
   }
 

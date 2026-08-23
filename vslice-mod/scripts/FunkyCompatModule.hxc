@@ -9,10 +9,8 @@
 import funkin.modding.module.Module;
 import funkin.modding.events.ScriptEvent;
 import funkin.util.Constants;
+import funkin.data.stage.StageRegistry;
 import StringTools;
-import sys.io.File;
-import sys.FileSystem;
-import lime.graphics.ImageFileFormat;
 
 class FunkyCompatModule extends Module
 {
@@ -20,6 +18,9 @@ class FunkyCompatModule extends Module
   var psych:FunkyCompatPsych;
   var codename:FunkyCompatCodename;
   var injector:FunkyCompatInject;
+  // Converted stage configs awaiting registration into StageRegistry once
+  // the registries have loaded (they load AFTER module onCreate).
+  var pendingStages:Array<Dynamic>;
 // ?arg: scriptInit may pass the class name; we don't need it.
   public function new(?arg:Dynamic)
   {
@@ -28,6 +29,7 @@ class FunkyCompatModule extends Module
     this.psych = new FunkyCompatPsych(this.util);
     this.codename = new FunkyCompatCodename(this.util);
     this.injector = new FunkyCompatInject(this.util);
+    this.pendingStages = [];
   }
 
   override function onCreate(event:ScriptEvent):Void
@@ -35,6 +37,35 @@ class FunkyCompatModule extends Module
     super.onCreate(event);
 
     trace('[FUNKY-COMPAT] Starting import pass...');
+
+    // Register the fake-3D wall-projection shader used by stages whose
+    // Codename scripts reference 3D models: the flat prerender is treated
+    // as a wall at world z=0 and sampled via ray intersection, giving
+    // true perspective parallax as the camera moves.
+    util.injectText('assets/shaders/fake3d.frag',
+      '#pragma header\n' +
+      'uniform float uCamX;\n' +
+      'uniform float uCamY;\n' +
+      'uniform float uCamZ;\n' +
+      'uniform vec2 uBase;\n' +
+      'uniform float uFocal;\n' +
+      'uniform vec2 uWall;\n' +
+      'void main()\n' +
+      '{\n' +
+      '  vec2 fc = openfl_TextureCoordv * openfl_TextureSize;\n' +
+      '  vec2 c = fc - openfl_TextureSize * 0.5;\n' +
+      '  vec3 dir = vec3(c.x, -c.y, uFocal);\n' +
+      '  float t = (0.0 - uCamZ) / dir.z;\n' +
+      '  vec2 world = vec2(uCamX, uCamY) + dir.xy * t;\n' +
+      '  vec2 rel = (world - uBase) / uWall;\n' +
+      '  vec2 uv = vec2(rel.x + 0.5, 0.5 - rel.y);\n' +
+      '  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)\n' +
+      '  {\n' +
+      '    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n' +
+      '    return;\n' +
+      '  }\n' +
+      '  gl_FragColor = flixel_texture2D(bitmap, uv);\n' +
+      '}');
 
     // Log which V-Slice build is running; non-0.8.x builds may need API
     // adjustments and the metadata api_version must match (install.sh).
@@ -150,40 +181,17 @@ class FunkyCompatModule extends Module
         imported++;
         trace('[FUNKY-COMPAT] Imported ${out.songs.length} songs, ${out.levels.length} weeks, ${out.stages.length} stages, ${out.chars.length} characters from "${modDir}".');
 
-        // Write generated ScriptedStage .hxc files to disk so Polymod
-        // discovers them as scripted stage entries at registry scan time.
+        // Collect runtime stage configs for in-memory registration.
+        // sys.* is blacklisted in HScript, so nothing is written to disk:
+        // each config is later applied to a shared FunkyCompatDynStage
+        // instance inserted directly into StageRegistry.entries (after the
+        // registries finish loading, which happens post-module-onCreate).
         if (out.stageScripts != null)
         {
-          var scriptsDir:String = 'mods/funky-compat/scripts';
-          if (!util.pathExists(scriptsDir))
-          {
-            try { FileSystem.createDirectory(scriptsDir); } catch (e:Dynamic) {}
-          }
           for (ss in 0...out.stageScripts.length)
           {
             var script:Dynamic = out.stageScripts[ss];
-            var scriptId:String = Std.string(script.id);
-            var scriptContent:String = Std.string(script.content);
-            // Derive file name from the class name in the script
-            var className:String = '';
-            var classIdx:Int = scriptContent.indexOf('class ');
-            if (classIdx >= 0)
-            {
-              var afterClass:String = scriptContent.substring(classIdx + 6);
-              var spaceIdx:Int = afterClass.indexOf(' ');
-              if (spaceIdx > 0) className = afterClass.substring(0, spaceIdx);
-            }
-            if (className == '') className = 'Stage_' + scriptId;
-            var filePath:String = scriptsDir + '/' + className + '.hxc';
-            try
-            {
-              sys.io.File.saveContent(filePath, scriptContent);
-              trace('[FUNKY-COMPAT] Wrote stage script: $filePath');
-            }
-            catch (e:Dynamic)
-            {
-              trace('[FUNKY-COMPAT] Failed to write stage script $filePath: $e');
-            }
+            pendingStages.push({id: Std.string(script.id), cfg: script.cfg});
           }
         }
       }
@@ -209,5 +217,57 @@ class FunkyCompatModule extends Module
       trace('[FUNKY-COMPAT] ${this.util.warnings.length} total warning(s). See log for details.');
     }
 
+    // Registries load AFTER module onCreate, so defer dynamic-stage
+    // registration to the first update tick (FlxTimer callbacks proved
+    // unreliable from module context).
+    if (pendingStages.length > 0)
+    {
+      trace('[FUNKY-COMPAT] ' + pendingStages.length + ' dynamic stage(s) pending registration.');
+    }
+
+    // EXPERIMENTAL 3D: models are parsed per-stage via buildDynCfg when a
+    // stage script references models/<name>.awd (see extractDynFX).
+  }
+
+  var stagesRegistered:Bool = false;
+
+  override function onUpdate(event:UpdateScriptEvent):Void
+  {
+    super.onUpdate(event);
+    if (!stagesRegistered && pendingStages.length > 0)
+    {
+      stagesRegistered = true;
+      registerDynStages();
+    }
+  }
+
+  // Insert one FunkyCompatDynStage instance per converted Codename stage
+  // directly into StageRegistry.entries. The instances read their baked
+  // config (anchors + FX) at play time; no files are written anywhere.
+  public function registerDynStages():Void
+  {
+    var registry = StageRegistry.instance;
+    var added:Int = 0;
+    for (i in 0...pendingStages.length)
+    {
+      var p:Dynamic = pendingStages[i];
+      var id:String = Std.string(p.id);
+      // The registry already created plain Stage instances for these ids
+      // from the injected virtual JSONs - replace them with DynStage
+      // instances carrying the raw engine anchors + FX.
+      try
+      {
+        var st = new FunkyCompatDynStage(id);
+        st.dyn = p.cfg;
+        registry.entries.set(id, st);
+        added++;
+      }
+      catch (e:Dynamic)
+      {
+        util.warn('Dynamic stage "$id" failed to register: $e');
+      }
+    }
+    pendingStages = [];
+    trace('[FUNKY-COMPAT] Registered $added dynamic stage(s) into the stage registry.');
   }
 }
