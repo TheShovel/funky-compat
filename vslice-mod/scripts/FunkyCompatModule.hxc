@@ -1,0 +1,213 @@
+// funky-compat - compatibility layer entry point.
+// A boot-time Module: scans the mods folder, detects Psych Engine and
+// Codename Engine mods, converts them to V-Slice data in memory, and injects
+// them into the asset cache + registries so the vanilla game renders them as
+// if they were native V-Slice mods.
+//
+// No files are written anywhere; foreign mods are never modified.
+
+import funkin.modding.module.Module;
+import funkin.modding.events.ScriptEvent;
+import funkin.util.Constants;
+import StringTools;
+import sys.io.File;
+import sys.FileSystem;
+import lime.graphics.ImageFileFormat;
+
+class FunkyCompatModule extends Module
+{
+  var util:FunkyCompatUtil;
+  var psych:FunkyCompatPsych;
+  var codename:FunkyCompatCodename;
+  var injector:FunkyCompatInject;
+// ?arg: scriptInit may pass the class name; we don't need it.
+  public function new(?arg:Dynamic)
+  {
+    super('funkycompat.layer', 1);
+    this.util = new FunkyCompatUtil();
+    this.psych = new FunkyCompatPsych(this.util);
+    this.codename = new FunkyCompatCodename(this.util);
+    this.injector = new FunkyCompatInject(this.util);
+  }
+
+  override function onCreate(event:ScriptEvent):Void
+  {
+    super.onCreate(event);
+
+    trace('[FUNKY-COMPAT] Starting import pass...');
+
+    // Log which V-Slice build is running; non-0.8.x builds may need API
+    // adjustments and the metadata api_version must match (install.sh).
+    var gameVersion:String = '';
+    try
+    {
+      gameVersion = Std.string(Constants.VERSION);
+    }
+    catch (e:Dynamic)
+    {
+      gameVersion = '';
+    }
+    trace('[FUNKY-COMPAT] Running on V-Slice $gameVersion');
+    if (gameVersion != '' && !StringTools.startsWith(gameVersion, 'v0.8'))
+    {
+      util.warn('Game version "$gameVersion" is outside the tested 0.8.x range; the layer may need adjustments.');
+    }
+
+    var modDirs:Array<String> = util.listDir('mods');
+    // Pre-filter: the candidates are the non-native folders (no metadata).
+    // Native mods (with metadata) are skipped by the game's own loader.
+    var candidates:Array<String> = [];
+    var skippedVslice:Int = 0;
+    for (modDir in modDirs)
+    {
+      if (util.fileExists('mods/$modDir/_polymod_meta.json'))
+      {
+        skippedVslice++;
+        continue;
+      }
+      // Skip non-directories (files like modsList.txt).
+      if (!util.pathExists('mods/$modDir')) continue;
+      candidates.push(modDir);
+    }
+
+    // Boot conversion progress overlay (raw OpenFL stage - FlxG.game doesn't
+    // exist yet this early). It is removed before the game canvas appears.
+    var imported:Int = 0;
+    var candidateTotal:Int = candidates.length;
+
+    for (ci in 0...candidateTotal)
+    {
+      var modDir:String = candidates[ci];
+      trace('[FUNKY-COMPAT] probing "' + modDir + '"...');
+
+      // Codename Engine signatures are stronger (modpack.ini, codenameChart
+      // charts, XML characters) - check it FIRST so codename mods with a
+      // data/ + songs/ layout aren't misdetected as Psych.
+      var isCodename:Bool = codename.detect(modDir);
+      var isPsych:Bool = false;
+      if (!isCodename)
+      {
+        isPsych = psych.detect(modDir);
+      }
+
+      if (!isPsych && !isCodename)
+      {
+        // Not a recognized foreign mod; leave it alone.
+        continue;
+      }
+
+      trace('[FUNKY-COMPAT] Importing "${modDir}" as ' + (isPsych ? 'Psych Engine' : 'Codename Engine') + ' mod...');
+
+      // Detect a square/4:3 aspect the mod DECLARED for itself (a boot-time
+      // window resize in data/global.hx etc. - e.g. gumballs calls
+      // resizeWindow(960, 720)). 0 means the mod keeps the 16:9 default.
+      var detectedAspect:Int = util.detectModAspect(modDir);
+      if (detectedAspect > 0)
+      {
+        trace('[FUNKY-COMPAT] "$modDir" declares a ${detectedAspect}x720 window - will re-frame gameplay to that view');
+      }
+
+      var out:Dynamic = {
+        texts: [],
+        images: [],
+        sounds: [],
+        songs: [],
+        levels: [],
+        stages: [],
+        chars: [],
+        playerChars: []
+      };
+      // Zip-backed mods have no on-disk files, so their assets must be served
+      // from memory; folder mods register lazy on-disk paths instead.
+      out.isZip = StringTools.endsWith(modDir.toLowerCase(), '.zip');
+
+      var beforeWarnings:Int = this.util.warnings.length;
+
+      try
+      {
+        if (isPsych)
+        {
+          psych.convert(modDir, out, detectedAspect);
+        }
+        else
+        {
+          codename.convert(modDir, out, detectedAspect);
+        }
+      }
+      catch (e:Dynamic)
+      {
+        trace('[FUNKY-COMPAT] Conversion error for "${modDir}": $e');
+        util.warn('Conversion error in "$modDir" (continuing with partial data): $e');
+      }
+
+      try
+      {
+        // Even a partially-converted mod is worth injecting - a hard failure
+        // mid-conversion (a malformed stage XML, a bad chart entry...) should
+        // not erase every song/stage that already converted.
+        trace('[FUNKY-COMPAT] Injecting ${out.texts.length} texts, ${out.images.length} images, ${out.sounds.length} sounds...');
+        injector.injectMod(out);
+        imported++;
+        trace('[FUNKY-COMPAT] Imported ${out.songs.length} songs, ${out.levels.length} weeks, ${out.stages.length} stages, ${out.chars.length} characters from "${modDir}".');
+
+        // Write generated ScriptedStage .hxc files to disk so Polymod
+        // discovers them as scripted stage entries at registry scan time.
+        if (out.stageScripts != null)
+        {
+          var scriptsDir:String = 'mods/funky-compat/scripts';
+          if (!util.pathExists(scriptsDir))
+          {
+            try { FileSystem.createDirectory(scriptsDir); } catch (e:Dynamic) {}
+          }
+          for (ss in 0...out.stageScripts.length)
+          {
+            var script:Dynamic = out.stageScripts[ss];
+            var scriptId:String = Std.string(script.id);
+            var scriptContent:String = Std.string(script.content);
+            // Derive file name from the class name in the script
+            var className:String = '';
+            var classIdx:Int = scriptContent.indexOf('class ');
+            if (classIdx >= 0)
+            {
+              var afterClass:String = scriptContent.substring(classIdx + 6);
+              var spaceIdx:Int = afterClass.indexOf(' ');
+              if (spaceIdx > 0) className = afterClass.substring(0, spaceIdx);
+            }
+            if (className == '') className = 'Stage_' + scriptId;
+            var filePath:String = scriptsDir + '/' + className + '.hxc';
+            try
+            {
+              sys.io.File.saveContent(filePath, scriptContent);
+              trace('[FUNKY-COMPAT] Wrote stage script: $filePath');
+            }
+            catch (e:Dynamic)
+            {
+              trace('[FUNKY-COMPAT] Failed to write stage script $filePath: $e');
+            }
+          }
+        }
+      }
+      catch (e:Dynamic)
+      {
+        trace('[FUNKY-COMPAT] Failed to inject mod "${modDir}": $e');
+        util.warn('Inject failed for "$modDir": $e');
+      }
+
+      if (this.util.warnings.length > beforeWarnings)
+      {
+        trace('[FUNKY-COMPAT] Warnings for "${modDir}":');
+        for (w in beforeWarnings...this.util.warnings.length)
+        {
+          trace('  - ' + this.util.warnings[w]);
+        }
+      }
+    }
+
+    trace('[FUNKY-COMPAT] Import pass complete. Imported $imported mod(s), skipped $skippedVslice native mod(s).');
+    if (this.util.warnings.length > 0)
+    {
+      trace('[FUNKY-COMPAT] ${this.util.warnings.length} total warning(s). See log for details.');
+    }
+
+  }
+}

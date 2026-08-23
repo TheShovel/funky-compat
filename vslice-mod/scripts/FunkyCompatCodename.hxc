@@ -1,0 +1,3113 @@
+// funky-compat - Codename Engine (1.x) mod importer.
+// Converts Codename mod data (charts, song meta, characters, stages, weeks,
+// audio) into V-Slice formats entirely in memory.
+//
+// Codename scripts (HScript states, song scripts, character/stage scripts)
+// are not portable and are skipped with a warning.
+
+import haxe.Json;
+import StringTools;
+import funkin.util.ReflectUtil;
+
+class FunkyCompatCodename
+{
+  public var util:FunkyCompatUtil;
+
+  // charId -> {w, h, s} frame dims + base scale (for top-left -> feet
+  // anchor conversion in stages).
+  var charMetrics:Dynamic;
+  // stageId -> {bf, dad, gf} char ids referenced by the first song that
+  // uses the stage (needed to know which sprites the anchors describe).
+  var stageCharHints:Dynamic;
+  // stageId -> {spriteName: alpha} create()-time sprite overrides extracted
+  // from the first song's scripts (the "hidethings" pattern: sprites hidden
+  // until an HScript Call event reveals them).
+  var stageSpritePatch:Dynamic;
+  // Optional tuning knobs from the layer's own config.json
+  // (mods/funky-compat/config.json):
+  //   cameraBiasY:      adds to the baked stage camera Y offset (moves the
+  //                     view up/down; characters appear higher/lower).
+  //   characterBiasY:   shifts the character feet directly (+y = lower).
+  var layerConfig:Dynamic;
+  // stageId (lowercased) -> true, for stages referenced by imported songs.
+  // Only these get converted/registered (skips decoding art for unused
+  // stages, which used to cost gigabytes of RAM at boot).
+  var usedStageIds:Dynamic;
+  // Framed view width (0 = 16:9) detected from the mod's stage layouts,
+  // passed into convert() by the module; used to emit aspect re-framing
+  // events for square/4:3-era mods (see detectStageAspect).
+  var detectedAspect:Int;
+  var songStageList:Array<Dynamic>;
+
+  public function new(util:FunkyCompatUtil)
+  {
+    this.util = util;
+    this.charMetrics = {};
+    this.stageCharHints = {};
+    this.stageSpritePatch = {};
+    this.layerConfig = null;
+    this.usedStageIds = {};
+    this.detectedAspect = 0;
+  }
+
+  public function getLayerConfig():Dynamic
+  {
+    if (layerConfig == null)
+    {
+      layerConfig = {};
+      var cfgText:String = util.readText('mods/funky-compat/config.json');
+      if (cfgText != null)
+      {
+        // haxe.Json rejects comments - strip them defensively so an edited
+        // config with notes still parses.
+        var stripped:String = '';
+        var lines:Array<String> = cfgText.split('\n');
+        for (ln in lines)
+        {
+          var li:Int = ln.indexOf('//');
+          if (li >= 0) ln = ln.substring(0, li);
+          stripped += ln + '\n';
+        }
+        try
+        {
+          var parsed:Dynamic = Json.parse(stripped);
+          if (parsed != null) layerConfig = parsed;
+        }
+        catch (e:Dynamic)
+        {
+          util.warn('Failed to parse funky-compat config.json - using defaults');
+        }
+      }
+    }
+    return layerConfig;
+  }
+
+  public function has(o:Dynamic, name:String):Bool
+  {
+    return ReflectUtil.hasField(o, name);
+  }
+
+  public function get(o:Dynamic, name:String):Dynamic
+  {
+    return ReflectUtil.getField(o, name);
+  }
+
+  public function set(o:Dynamic, name:String, value:Dynamic):Void
+  {
+    ReflectUtil.setAnonymousField(o, name, value);
+  }
+
+  // ------------------------------------------------------------------
+  // Detection
+  // ------------------------------------------------------------------
+
+  public function detect(dir:String):Bool
+  {
+    if (!util.pathExists('mods/$dir')) return false;
+    if (util.fileExists('mods/$dir/data/config/modpack.ini')) return true;
+    // Charts with codenameChart: true are unambiguous.
+    if (util.pathExists('mods/$dir/songs'))
+    {
+      var songDirs:Array<String> = util.listDir('mods/$dir/songs');
+      for (songDir in songDirs)
+      {
+        if (!util.pathExists('mods/$dir/songs/$songDir')) continue;
+        if (!util.pathExists('mods/$dir/songs/$songDir/charts')) continue;
+        var chartFiles:Array<String> = util.listDir('mods/$dir/songs/$songDir/charts');
+        for (chartFile in chartFiles)
+        {
+          if (!StringTools.endsWith(chartFile.toLowerCase(), '.json')) continue;
+          var chart:Dynamic = util.readJson('mods/$dir/songs/$songDir/charts/$chartFile');
+          if (chart != null && get(chart, 'codenameChart') == true) return true;
+        }
+      }
+    }
+    // Character XML is codename-specific (psych uses JSON).
+    if (util.pathExists('mods/$dir/data/characters'))
+    {
+      var charFiles:Array<String> = util.listDir('mods/$dir/data/characters');
+      for (charFile in charFiles)
+      {
+        if (StringTools.endsWith(charFile.toLowerCase(), '.xml')) return true;
+      }
+    }
+    return false;
+  }
+
+  // ------------------------------------------------------------------
+  // Output helpers
+  // ------------------------------------------------------------------
+
+  public function addText(out:Dynamic, paths:Array<String>, content:String):Void
+  {
+    out.texts.push({paths: paths, content: content});
+  }
+
+  // Register an image from the mod's images/ folder. `keyOverride` rebinds
+  // the asset-cache key when the emitted id was namespaced (cross-mod
+  // collision): the file is read from its real disk path, but registered
+  // under the unique key so another mod's identically-named art cannot
+  // override it.
+  public function addImage(out:Dynamic, modDir:String, relPath:String, ?keyOverride:String):Void
+  {
+    var entry:Dynamic = util.resolveFileEntry(out, 'mods/$modDir/images/$relPath');
+    if (entry == null) return;
+    var key:String = (keyOverride != null && keyOverride != '') ? keyOverride : relPath;
+    out.images.push({paths: util.imageKeys(key), bytes: entry.bytes, file: entry.file});
+    var xmlRel:String = relPath;
+    if (StringTools.endsWith(xmlRel.toLowerCase(), '.png')) xmlRel = xmlRel.substring(0, xmlRel.length - 4);
+    var xmlKey:String = key;
+    if (StringTools.endsWith(xmlKey.toLowerCase(), '.png')) xmlKey = xmlKey.substring(0, xmlKey.length - 4);
+    var xmlText:String = util.readText('mods/$modDir/images/$xmlRel.xml');
+    if (xmlText != null)
+    {
+      out.texts.push({paths: util.imageKeys('$xmlKey.xml'), content: xmlText});
+    }
+  }
+
+  // V-Slice resolves health icons as icons/icon-<characterId>. Imported
+  // mods ship icons in too many formats to support (two-frame PNGs, sparrow
+  // XMLs, shared icon ids...) - register the layer's transparent placeholder
+  // instead so the health bar icon is invisible.
+  public function addIconAlias(out:Dynamic, modDir:String, iconName:String, charId:String):Void
+  {
+    util.registerTransparentIcon(out, charId);
+  }
+
+  public function addSound(out:Dynamic, paths:Array<String>, entry:Dynamic):Void
+  {
+    if (entry == null) return;
+    if (entry.bytes == null && entry.file == null) return;
+    out.sounds.push({paths: paths, bytes: entry.bytes, file: entry.file});
+  }
+
+  // ------------------------------------------------------------------
+  // Weeks -> Levels
+  // ------------------------------------------------------------------
+  public function convertWeeks(dir:String, out:Dynamic):Void
+  {
+    var weeksRoot:String = 'mods/$dir/data/weeks';
+    if (!util.pathExists('$weeksRoot/weeks')) return;
+
+    // Map display names to song ids.
+    var songIdMap:Dynamic = {};
+    for (songId in out.songs)
+    {
+      set(songIdMap, util.normalizeId(songId), songId);
+    }
+
+    var order:Array<String> = [];
+    var seen:Dynamic = {};
+    if (util.fileExists('$weeksRoot/weeks.txt'))
+    {
+      var orderText:String = util.readText('$weeksRoot/weeks.txt');
+      var lines:Array<String> = orderText.split('\n');
+      for (lineRaw in lines)
+      {
+        var line:String = StringTools.trim(lineRaw);
+        if (line == '' || StringTools.startsWith(line, '#')) continue;
+        var key:String = line;
+        if (StringTools.endsWith(key.toLowerCase(), '.xml')) key = key.substring(0, key.length - 4);
+        order.push(line);
+        set(seen, key, true);
+      }
+    }
+    // weeks.txt is often just a template for sorting - ALWAYS also load the
+    // actual week XMLs on disk that were not listed there.
+    var weekFiles:Array<String> = util.listDir('$weeksRoot/weeks');
+    for (weekFile in weekFiles)
+    {
+      if (!StringTools.endsWith(weekFile.toLowerCase(), '.xml')) continue;
+      var weekKey:String = weekFile.substring(0, weekFile.length - 4);
+      if (get(seen, weekKey) == true) continue;
+      order.push(weekFile);
+      set(seen, weekKey, true);
+    }
+
+    for (weekEntry in order)
+    {
+      var weekId:String = weekEntry;
+      if (StringTools.endsWith(weekId.toLowerCase(), '.xml')) weekId = weekId.substring(0, weekId.length - 4);
+      var xmlText:String = util.readText('$weeksRoot/weeks/$weekId.xml');
+      if (xmlText == null) continue; // e.g. 'template' listed in weeks.txt without an XML
+
+      var levelSongs:Array<String> = [];
+      var songBodies:Array<String> = extractTags(xmlText, 'song');
+      var songContents:Array<String> = extractElementTexts(xmlText, 'song');
+      for (si in 0...songBodies.length)
+      {
+        var body:String = songBodies[si];
+        var hide:String = attr(body, 'hide');
+        if (hide == 'true') continue;
+        var name:String = '';
+        if (si < songContents.length) name = StringTools.trim(songContents[si]);
+        if (name == '') continue;
+        var lookup:String = util.normalizeId(name);
+        var songId:Null<String> = get(songIdMap, lookup);
+        if (songId == null || songId == '' || songId == 'null') songId = lookup;
+        if (levelSongs.indexOf(songId) == -1) levelSongs.push(songId);
+      }
+
+      var displayName:String = attr(extractFirstTag(xmlText, 'week'), 'name');
+      if (displayName == null || displayName == '') displayName = weekId;
+      var bgColor:String = attr(extractFirstTag(xmlText, 'week'), 'bgColor');
+      if (bgColor == null || bgColor == '') bgColor = '#F9CF51';
+
+      // A week id another imported mod already claimed would shadow its level
+      // in the shared LevelRegistry - namespace it like the other ids.
+      weekId = util.disambiguateId('levels', dir, weekId);
+      if (weekId == '') continue;
+
+      var levelData:Dynamic = {
+        version: '1.0.0',
+        name: displayName,
+        titleAsset: 'storymenu/titles/$weekId',
+        props: [],
+        background: bgColor,
+        songs: levelSongs
+      };
+      addText(out, util.dataTextKeys('levels/$weekId.json'), util.stringify(levelData));
+      out.levels.push(weekId);
+      util.claimForeign('levels', weekId);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Tiny XML helpers (no Xml API needed)
+  // ------------------------------------------------------------------
+
+  // Attr-body of every occurrence of <tagName ...>.
+  public function extractTags(xml:String, tagName:String):Array<String>
+  {
+    var result:Array<String> = [];
+    var pos:Int = 0;
+    var openTag:String = '<' + tagName;
+    while (pos < xml.length)
+    {
+      var o:Int = xml.indexOf(openTag, pos);
+      if (o < 0) break;
+      var b:String = xml.charAt(o + openTag.length);
+      if (b != ' ' && b != '>' && b != '/' && b != '\t' && b != '\n' && b != '\r')
+      {
+        pos = o + openTag.length;
+        continue;
+      }
+      var g:Int = xml.indexOf('>', o);
+      if (g < 0) break;
+      result.push(xml.substring(o + openTag.length, g));
+      pos = g + 1;
+    }
+    return result;
+  }
+
+  // Text content of every <tagName>...</tagName> element.
+  public function extractElementTexts(xml:String, tagName:String):Array<String>
+  {
+    var result:Array<String> = [];
+    var pos:Int = 0;
+    var openTag:String = '<' + tagName;
+    var closeTag:String = '</' + tagName;
+    while (pos < xml.length)
+    {
+      var o:Int = xml.indexOf(openTag, pos);
+      if (o < 0) break;
+      var g:Int = xml.indexOf('>', o);
+      if (g < 0) break;
+      var c:Int = xml.indexOf(closeTag, g + 1);
+      if (c < 0) break;
+      result.push(xml.substring(g + 1, c));
+      pos = c + closeTag.length;
+    }
+    return result;
+  }
+
+  public function extractFirstTag(xml:String, tagName:String):String
+  {
+    var tags:Array<String> = extractTags(xml, tagName);
+    if (tags.length == 0) return '';
+    return tags[0];
+  }
+
+  // Extract create()-time sprite overrides from a codename song script
+  // (the "hidethings" pattern):
+  //   var table = stage.getSprite("table");
+  //   table.visible = false;
+  //   crack.alpha = 0.0;
+  // Returns {spriteName: alpha}. Only the create() function is scanned.
+  public function scriptSpriteOverrides(scriptText:String):Dynamic
+  {
+    var result:Dynamic = {};
+    if (scriptText == null) return result;
+    var startIdx:Int = scriptText.indexOf('function create(');
+    if (startIdx < 0) return result;
+    var endIdx:Int = scriptText.indexOf('function ', startIdx + 1);
+    if (endIdx < 0) endIdx = scriptText.length;
+    var body:String = scriptText.substring(startIdx, endIdx);
+
+    // Map script variable names to sprite names.
+    var varToSprite:Dynamic = {};
+    var pos:Int = 0;
+    var needle:String = 'stage.getSprite(';
+    while (pos < body.length)
+    {
+      var g:Int = body.indexOf(needle, pos);
+      if (g < 0) break;
+      var eq:Int = body.lastIndexOf('=', g);
+      if (eq >= 0)
+      {
+        var vstart:Int = body.lastIndexOf(';', eq) + 1;
+        var vname:String = StringTools.trim(body.substring(vstart, eq));
+        if (StringTools.startsWith(vname.toLowerCase(), 'var ')) vname = StringTools.trim(vname.substring(4));
+        var q1:Int = body.indexOf('"', g + needle.length);
+        var q2:Int = body.indexOf('"', q1 + 1);
+        if (vname != '' && q1 >= 0 && q2 > q1)
+        {
+          set(varToSprite, vname, body.substring(q1 + 1, q2));
+        }
+      }
+      pos = g + 1;
+    }
+
+    for (field in ReflectUtil.fields(varToSprite))
+    {
+      var spriteName:String = Std.string(get(varToSprite, field));
+      if (spriteName == '') continue;
+      var hidden:Bool = body.indexOf('$field.visible = false') >= 0 || body.indexOf('$field.visible=false') >= 0;
+      var alphaVal:Float = -1;
+      var aIdx:Int = body.indexOf('$field.alpha = ');
+      if (aIdx < 0) aIdx = body.indexOf('$field.alpha=');
+      if (aIdx >= 0)
+      {
+        var rest:String = body.substring(aIdx + ('$field.alpha = ').length);
+        if (rest.length == 0) continue;
+        var num:String = '';
+        for (ci in 0...rest.length)
+        {
+          var cc:Int = rest.charCodeAt(ci);
+          if ((cc >= 48 && cc <= 57) || cc == 46 || cc == 45) num += rest.charAt(ci);
+          else break;
+        }
+        var av:Float = Std.parseFloat(num);
+        if (!Math.isNaN(av)) alphaVal = av;
+      }
+      else if (hidden)
+      {
+        alphaVal = 0;
+      }
+      if (alphaVal >= 0)
+      {
+        set(result, spriteName, alphaVal);
+      }
+    }
+
+    // Character anchors are referenced directly in scripts (not via
+    // stage.getSprite): 'dad.visible = false', 'gf.visible = false', etc.
+    var charRefs:Array<String> = ['dad', 'boyfriend', 'gf', 'girlfriend', 'player', 'opponent'];
+    for (ref in charRefs)
+    {
+      if (get(result, ref) != null) continue;
+      var hidden2:Bool = body.indexOf('$ref.visible = false') >= 0 || body.indexOf('$ref.visible=false') >= 0;
+      var alphaVal2:Float = -1;
+      var aIdx2:Int = body.indexOf('$ref.alpha = ');
+      if (aIdx2 < 0) aIdx2 = body.indexOf('$ref.alpha=');
+      if (aIdx2 >= 0)
+      {
+        var rest2:String = body.substring(aIdx2 + ('$ref.alpha = ').length);
+        if (rest2.length > 0)
+        {
+          var num2:String = '';
+          for (ci in 0...rest2.length)
+          {
+            var cc2:Int = rest2.charCodeAt(ci);
+            if ((cc2 >= 48 && cc2 <= 57) || cc2 == 46 || cc2 == 45) num2 += rest2.charAt(ci);
+            else break;
+          }
+          var av2:Float = Std.parseFloat(num2);
+          if (!Math.isNaN(av2)) alphaVal2 = av2;
+        }
+      }
+      else if (hidden2)
+      {
+        alphaVal2 = 0;
+      }
+      if (alphaVal2 >= 0)
+      {
+        set(result, ref, alphaVal2);
+      }
+    }
+    return result;
+  }
+
+  // Sprite-hide effects of script functions that are called within the FIRST
+  // THIRD of the song (the intro/flash choreography). Returns {sprite: 0}.
+  // Scripts reference stage sprites through file-scoped vars
+  // ('var x = stage.getSprite("name")') and their functions toggle
+  // visibility; 'HScript Call' chart events name the functions and their
+  // times. Sprites whose hiding function fires early in the song are intro
+  // overlays (e.g. backrooms' Kane logo fade-black) - default them to hidden
+  // so they do not linger on screen, since the reveal events themselves
+  // cannot run in V-Slice.
+  public function scriptIntroHides(scriptTexts:Array<String>, rawEvents:Array<Dynamic>, songLenMs:Float):Dynamic
+  {
+    var result:Dynamic = {};
+    if (songLenMs <= 0) return result;
+
+    // Earliest invocation time per script function name.
+    var callTimes:Dynamic = {};
+    for (ev in rawEvents)
+    {
+      if (ev == null) continue;
+      var evName:String = util.getString(get(ev, 'name'), '');
+      if (evName != 'HScript Call') continue;
+      var evParams:Dynamic = get(ev, 'params');
+      if (evParams == null || evParams.length < 1) continue;
+      var fnName:String = Std.string(evParams[0]);
+      if (fnName == null || fnName == '') continue;
+      var evTime:Float = util.getFloat(get(ev, 'time'), -1);
+      var seen:Float = util.getFloat(get(callTimes, fnName), -1);
+      if (seen < 0 || (evTime >= 0 && evTime < seen)) set(callTimes, fnName, evTime);
+    }
+    var introLimit:Float = songLenMs * 0.3;
+
+    for (sti in 0...scriptTexts.length)
+    {
+      var text:String = scriptTexts[sti];
+      if (text == null || text == '') continue;
+
+      // File-scope sprite-var map ('var x = stage.getSprite("name")').
+      var vmap:Dynamic = {};
+      var pos:Int = 0;
+      while (pos < text.length)
+      {
+        var g:Int = text.indexOf('stage.getSprite(', pos);
+        if (g < 0) break;
+        var eq:Int = text.lastIndexOf('=', g);
+        if (eq >= 0)
+        {
+          var vstart:Int = text.lastIndexOf(';', eq) + 1;
+          var vname:String = StringTools.trim(text.substring(vstart, eq));
+          if (StringTools.startsWith(vname.toLowerCase(), 'var ')) vname = StringTools.trim(vname.substring(4));
+          var q1:Int = text.indexOf('"', g + 'stage.getSprite('.length);
+          var q2:Int = text.indexOf('"', q1 + 1);
+          if (vname != '' && q1 >= 0 && q2 > q1) set(vmap, vname, text.substring(q1 + 1, q2));
+        }
+        pos = g + 1;
+      }
+
+      // Function blocks: name + body text.
+      var fnIdx:Int = 0;
+      while (true)
+      {
+        var fs:Int = text.indexOf('function ', fnIdx);
+        if (fs < 0) break;
+        var fe:Int = text.indexOf('function ', fs + 1);
+        if (fe < 0) fe = text.length;
+        var block:String = text.substring(fs, fe);
+        var pOpen:Int = block.indexOf('(');
+        var fnName2:String = '';
+        if (pOpen >= 0)
+        {
+          fnName2 = StringTools.trim(block.substring('function '.length, pOpen));
+        }
+        if (fnName2 != '')
+        {
+          var callT:Float = util.getFloat(get(callTimes, fnName2), -1);
+          if (callT >= 0 && callT <= introLimit)
+          {
+            for (field in ReflectUtil.fields(vmap))
+            {
+              var sprName:String = Std.string(get(vmap, field));
+              if (sprName == '' || get(result, sprName) != null) continue;
+              var hide:Bool = block.indexOf('$field.visible = false') >= 0 || block.indexOf('$field.visible=false') >= 0;
+              hide = hide || block.indexOf('$field.alpha = 0') >= 0 || block.indexOf('$field.alpha=0') >= 0;
+              // Tweens: FlxTween.tween(x, {alpha: 0.0}, ...) fades the sprite out.
+              hide = hide || block.indexOf('$field, {alpha: 0') >= 0;
+              if (hide) set(result, sprName, 0);
+            }
+          }
+        }
+        fnIdx = fe;
+      }
+    }
+    return result;
+  }
+
+  // Attr-body of every occurrence of <tagName ...>, sorted by document order,
+  // for any of the given tag names. Each entry also carries openEnd/closePos
+  // (the index range of the element's child content) so callers can parse
+  // child elements like <anim> that live after the tag's '>'.
+  public function orderedTags(xml:String, tagNames:Array<String>):Array<Dynamic>
+  {
+    var result:Array<Dynamic> = [];
+    var pos:Int = 0;
+    while (pos < xml.length)
+    {
+      // Find the earliest occurrence of any requested tag.
+      var bestIdx:Int = -1;
+      var bestName:String = '';
+      for (tn in tagNames)
+      {
+        var o:Int = xml.indexOf('<' + tn, pos);
+        if (o >= 0 && (bestIdx < 0 || o < bestIdx))
+        {
+          bestIdx = o;
+          bestName = tn;
+        }
+      }
+      if (bestIdx < 0) break;
+      var openTag:String = '<' + bestName;
+      var b:String = xml.charAt(bestIdx + openTag.length);
+      if (b != ' ' && b != '>' && b != '/' && b != '\t' && b != '\n' && b != '\r')
+      {
+        pos = bestIdx + openTag.length;
+        continue;
+      }
+      var g:Int = xml.indexOf('>', bestIdx);
+      if (g < 0) break;
+      var openEnd:Int = g + 1;
+      var closePos:Int = openEnd;
+      if (g > bestIdx && xml.charAt(g - 1) == '/')
+      {
+        // Self-closing element: no children beyond the open tag.
+        pos = openEnd;
+      }
+      else
+      {
+        var closeTag:String = '</' + bestName + '>';
+        var c:Int = xml.indexOf(closeTag, openEnd);
+        if (c < 0)
+        {
+          // Unclosed element - treat the rest of the document as content.
+          closePos = xml.length;
+          pos = xml.length;
+        }
+        else
+        {
+          closePos = c;
+          pos = c + closeTag.length;
+        }
+      }
+      result.push({name: bestName, body: xml.substring(bestIdx + openTag.length, g), openEnd: openEnd, closePos: closePos});
+    }
+    return result;
+  }
+
+  // Read key="value" from an attr-body string.
+  public function attr(body:String, name:String):Null<String>
+  {
+    if (body == null) return null;
+    var needle:String = name + '=';
+    var idx:Int = body.indexOf(needle);
+    if (idx < 0) return null;
+    var rest:String = body.substring(idx + needle.length);
+    if (rest.length == 0) return null;
+    var quote:String = rest.charAt(0);
+    if (quote != '"' && quote != "'") return null;
+    var end:Int = rest.indexOf(quote, 1);
+    if (end < 0) return null;
+    return rest.substring(1, end);
+  }
+
+  // Expand codename-style indices ("2..12,0,1") into an int array.
+  public function expandIndices(raw:String):Array<Int>
+  {
+    var result:Array<Int> = [];
+    var parts:Array<String> = raw.split(',');
+    for (pi in 0...parts.length)
+    {
+      var part:String = StringTools.trim(parts[pi]);
+      if (part == '') continue;
+      var dot:Int = part.indexOf('..');
+      if (dot >= 0)
+      {
+        var a:Int = Std.parseInt(StringTools.trim(part.substring(0, dot)));
+        var b:Int = Std.parseInt(StringTools.trim(part.substring(dot + 2)));
+        if (a == null) a = 0;
+        if (b == null) b = 0;
+        var step:Int = a <= b ? 1 : -1;
+        var cur:Int = a;
+        while (step > 0 ? cur <= b : cur >= b)
+        {
+          result.push(cur);
+          cur += step;
+        }
+      }
+      else
+      {
+        var v:Int = Std.parseInt(part);
+        if (v != null) result.push(v);
+      }
+    }
+    return result;
+  }
+
+  // Map a Codename strumline to the V-Slice character slot it drives.
+  // Codename resolves the slot from the strumline's `position` STRING
+  // ("boyfriend"/"girlfriend"/"dad") and only falls back to the numeric
+  // `type` when position is absent - a girlfriend line can carry type 0
+  // (e.g. gumballs' "memory card"), so keying off type alone would clobber
+  // the opponent slot with the gf character.
+  public function strumlineCharSlot(line:Dynamic, lineType:Int):String
+  {
+    var posRaw:Dynamic = get(line, 'position');
+    if (posRaw != null && posRaw != '')
+    {
+      var pos:String = Std.string(posRaw).toLowerCase();
+      if (pos == 'boyfriend' || pos == 'player' || pos == 'bf') return 'boyfriend';
+      if (pos == 'girlfriend' || pos == 'gf') return 'girlfriend';
+      if (pos == 'dad' || pos == 'opponent') return 'dad';
+      // Custom named anchor - V-Slice only has 3 character slots, so
+      // treat anything else as the opponent slot.
+      return 'dad';
+    }
+    if (lineType == 1) return 'boyfriend';
+    if (lineType == 2) return 'girlfriend';
+    return 'dad';
+  }
+
+  public function convertSongs(dir:String, out:Dynamic):Void
+  {
+    var songsRoot:String = 'mods/$dir/songs';
+    if (!util.pathExists(songsRoot)) return;
+    var songDirs:Array<String> = util.listDir(songsRoot);
+    for (songFolder in songDirs)
+    {
+      if (!util.pathExists('$songsRoot/$songFolder')) continue;
+      var songBase:String = '$songsRoot/$songFolder';
+      if (!util.pathExists('$songBase/charts')) continue;
+      // Song scripts (notes/*.hx etc.) are HScript - data imports fine but
+      // the scripts themselves cannot run in V-Slice.
+      var songScripts:Array<String> = util.listDir('$songBase/scripts');
+      for (scriptFile in songScripts)
+      {
+        if (StringTools.endsWith(scriptFile.toLowerCase(), '.hx'))
+        {
+          util.warn('Codename: song script $songFolder/scripts/$scriptFile is not portable to V-Slice (HScript)');
+        }
+      }
+      // V-Slice lowercases song ids when building audio keys (Paths.inst /
+      // Paths.voices), and data lookups use the id verbatim - so the
+      // registered id and all injected keys must be lowercase. The original
+      // folder name is still used for on-disk reads (songBase above).
+      var songId:String = songFolder.toLowerCase();
+
+      var metaJson:Dynamic = util.readJson('$songBase/meta.json');
+      if (metaJson == null) metaJson = {};
+
+      // Difficulties: meta list, or chart file names.
+      var difficulties:Array<String> = [];
+      var metaDiffs:Dynamic = get(metaJson, 'difficulties');
+      if (metaDiffs != null && metaDiffs.length > 0)
+      {
+        for (di in 0...metaDiffs.length)
+        {
+          difficulties.push(Std.string(metaDiffs[di]));
+        }
+      }
+      else
+      {
+        var chartFiles:Array<String> = util.listDir('$songBase/charts');
+        for (chartFile in chartFiles)
+        {
+          if (!StringTools.endsWith(chartFile.toLowerCase(), '.json')) continue;
+          difficulties.push(chartFile.substring(0, chartFile.length - 5));
+        }
+      }
+
+      // Parse each chart difficulty.
+      var notesJson:Dynamic = {};
+      var flatEvents:Array<Dynamic> = []; // shared across difficulties (native format)
+      var seenEvents:Dynamic = {};
+      var scrollSpeeds:Dynamic = {};
+      var timeChangeEvents:Array<Dynamic> = [];
+
+      if (difficulties.length == 0)
+      {
+        util.warn('Codename: song $songId has no chart difficulties, skipping');
+        continue;
+      }
+
+      // Only import difficulties that actually have a chart file.
+      // V-Slice difficulty ids are lowercase (easy/normal/hard/erect/...),
+      // while Codename names them "Normal"/"Hard"/"Normal-Erect". Chart
+      // FILES keep their original names on disk; the converted metadata and
+      // chart JSON use the mapped lowercase ids so freeplay's difficulty
+      // filtering (which is case-sensitive) matches the base game ids.
+      //
+      // Chart file lookup is case-insensitive: some mods mix case between
+      // meta.json and the chart files on disk.
+      var chartFilesOnDisk:Dynamic = {};
+      var listedChartFiles:Array<String> = util.listDir('$songBase/charts');
+      for (cf in listedChartFiles)
+      {
+        if (!StringTools.endsWith(cf.toLowerCase(), '.json')) continue;
+        var cfBase:String = cf.substring(0, cf.length - 5);
+        set(chartFilesOnDisk, cfBase.toLowerCase(), cfBase);
+      }
+      var realDifficulties:Array<String> = [];
+      var diffIds:Array<String> = [];
+      for (di in 0...difficulties.length)
+      {
+        var diffName:String = difficulties[di];
+        if (diffName == null || StringTools.trim(diffName) == '') continue;
+        var actualName:String = diffName;
+        if (!util.fileExists('$songBase/charts/$diffName.json'))
+        {
+          var match:Null<String> = get(chartFilesOnDisk, StringTools.trim(diffName).toLowerCase());
+          if (match == null || match == '')
+          {
+            util.warn('Codename: $songId lists difficulty "$diffName" but has no chart file');
+            continue;
+          }
+          actualName = match;
+        }
+        var mapped:String = vsliceDiffId(diffName);
+        if (mapped == '' || diffIds.indexOf(mapped) != -1) continue;
+        realDifficulties.push(actualName);
+        diffIds.push(mapped);
+      }
+      difficulties = realDifficulties;
+      if (difficulties.length == 0)
+      {
+        util.warn('Codename: song $songId has no importable chart files, skipping');
+        continue;
+      }
+
+      // A mod song whose id matches a built-in V-Slice song (e.g. a
+      // "bopeebo" remake) would fight the vanilla metadata/chart/audio for
+      // the same asset keys and break the mod song. Import it under a
+      // suffixed id and key EVERY emitted asset (metadata, chart, audio)
+      // under the new id; on-disk reads above keep the original folder name.
+      var emitId:String = songId;
+      if (util.fileExists('assets/data/songs/$songId/$songId-metadata.json'))
+      {
+        emitId = songId + '-fc';
+        util.warn('Codename: song "$songId" collides with a built-in V-Slice song - importing the mod version as "$emitId" (assets keyed under the new id too)');
+      }
+      if (util.isForeignTaken('songs', emitId))
+      {
+        emitId = emitId + '-' + util.modSlug(dir);
+        util.warn('Codename: song "$songId" is also defined by another imported mod - importing this mod version as "$emitId" (assets keyed under the new id too)');
+      }
+
+      var bpm:Float = util.getFloat(get(metaJson, 'bpm'), 100);
+
+      // Global events (shared across difficulties).
+      var globalEvents:Array<Dynamic> = [];
+      var globalEventsFile:Dynamic = util.readJson('$songBase/events.json');
+      if (globalEventsFile != null)
+      {
+        var globalList:Dynamic = get(globalEventsFile, 'events');
+        if (globalList != null)
+        {
+          for (gi in 0...globalList.length)
+          {
+            globalEvents.push(globalList[gi]);
+          }
+        }
+      }
+
+      for (di in 0...difficulties.length)
+      {
+        var diff:String = difficulties[di]; // original file name on disk
+        var diffId:String = diffIds[di]; // mapped vslice id for output
+        var chart:Dynamic = util.readJson('$songBase/charts/$diff.json');
+        if (chart == null) continue;
+
+        var notesArr:Array<Dynamic> = [];
+        var eventsArr:Array<Dynamic> = [];
+        var scrollSpeed:Float = util.getFloat(get(chart, 'scrollSpeed'), 1);
+        var warnedNoteTypes:Dynamic = {};
+
+        // Codename mods may embed legacy/psych-format charts; the engine
+        // converts them at runtime. We do the same conversion ourselves.
+        if (get(chart, 'codenameChart') != true)
+        {
+          var songObj:Dynamic = chart;
+          if (get(chart, 'song') != null && !isPrimitive(get(chart, 'song'))) songObj = get(chart, 'song');
+          var legacyTimeChanges:Array<Dynamic> = [];
+          convertLegacyChart(songObj, bpm, notesArr, eventsArr, legacyTimeChanges);
+          if (get(songObj, 'speed') != null) scrollSpeed = util.getFloat(get(songObj, 'speed'), scrollSpeed);
+          // BPM changes from long chart sections.
+          for (tc in legacyTimeChanges)
+          {
+            timeChangeEvents.push(tc);
+          }
+          // Legacy events are psych-style tuples.
+          eventsArr = convertLegacyEvents(get(songObj, 'events'));
+          set(notesJson, diffId, notesArr);
+          appendUnique(flatEvents, seenEvents, eventsArr);
+          set(scrollSpeeds, diffId, scrollSpeed);
+          continue;
+        }
+
+        var strumLines:Array<Dynamic> = get(chart, 'strumLines');
+        if (strumLines != null)
+        {
+          for (sl in 0...strumLines.length)
+          {
+            var line:Dynamic = strumLines[sl];
+            if (line == null) continue;
+            var lineType:Int = util.getInt(get(line, 'type'), 0);
+            // Warn once per difficulty on non-4K charts - lane math assumes 4K.
+            var keyCount:Int = util.getInt(get(line, 'keyCount'), 4);
+            if (keyCount != 4)
+            {
+              util.warn('Codename: $keyCountK strumline in $songId ($diff) is approximated as 4K');
+            }
+            // Warn about extra characters on a strumline - V-Slice only
+            // renders one sprite per slot.
+            var lineChars:Dynamic = get(line, 'characters');
+            if (lineChars != null && lineChars.length > 1)
+            {
+              util.warn('Codename: extra characters on a strumline in $songId ($diff) are not rendered');
+            }
+            // Girlfriend strumline: not representable natively, skip its
+            // notes. Matches Codename's slot resolution (a GF line may carry
+            // type 0 with position="girlfriend" - e.g. gumballs "memory card").
+            if (strumlineCharSlot(line, lineType) == 'girlfriend')
+            {
+              var gfNotes:Dynamic = get(line, 'notes');
+              if (gfNotes != null && gfNotes.length > 0)
+              {
+                util.warn('Codename: GF strumline notes skipped in $songId ($diff)');
+              }
+              continue;
+            }
+            var sideOffset:Int = 0;
+            // V-Slice lane convention: player strumline = data 0-3, opponent
+            // strumline = data 4-7 (getStrumlineIndex()==0 routes to the
+            // player). Codename is the opposite (type 1 = player, on the
+            // right) - so player lines get 0-3 and opponent lines get 4-7.
+            if (lineType != 1) sideOffset = 4;
+            var lineNotes:Array<Dynamic> = get(line, 'notes');
+            if (lineNotes != null)
+            {
+              for (ni in 0...lineNotes.length)
+              {
+                var note:Dynamic = lineNotes[ni];
+                if (note == null) continue;
+                var t:Float = util.getFloat(get(note, 'time'), 0);
+                var id:Int = util.getInt(get(note, 'id'), 0);
+                var sLen:Float = util.getFloat(get(note, 'sLen'), 0);
+                // Codename note types: 0 = normal; other types (mines, etc.)
+                // are not representable - warn once per type per difficulty.
+                var noteType:Int = util.getInt(get(note, 'type'), 0);
+                if (noteType != 0 && get(warnedNoteTypes, 't$noteType') == null)
+                {
+                  set(warnedNoteTypes, 't$noteType', true);
+                  util.warn('Codename: note type $noteType skipped in $songId ($diff)');
+                }
+                var noteObj:Dynamic = {t: t, d: sideOffset + id};
+                if (sLen > 0) noteObj.l = sLen;
+                notesArr.push(noteObj);
+              }
+            }
+          }
+        }
+
+        // Chart-local events.
+        var chartEvents:Dynamic = get(chart, 'events');
+        if (chartEvents != null)
+        {
+          for (ei in 0...chartEvents.length)
+          {
+            eventsArr.push(chartEvents[ei]);
+          }
+        }
+        // Global events for this difficulty.
+        for (gi in 0...globalEvents.length)
+        {
+          eventsArr.push(globalEvents[gi]);
+        }
+
+        set(notesJson, diffId, notesArr);
+        appendUnique(flatEvents, seenEvents, mapEvents(eventsArr, songId, diffId, timeChangeEvents));
+        set(scrollSpeeds, diffId, scrollSpeed);
+      }
+
+      var runBpm:Float = bpm;
+      var timeChanges:Array<Dynamic> = [{t: 0, b: 0, bpm: runBpm, bt: [4, 4, 4, 4]}];
+      for (tc in timeChangeEvents)
+      {
+        var t:Float = util.getFloat(get(tc, 't'), 0);
+        if (Math.abs(t) < 0.001) continue;
+        var bpmVal:Float = util.getFloat(get(tc, 'bpm'), -1);
+        if (bpmVal > 0) runBpm = bpmVal;
+        var entry:Dynamic = {t: t, bpm: runBpm, bt: [4, 4, 4, 4]};
+        if (get(tc, 'bt') != null) entry.bt = get(tc, 'bt');
+        timeChanges.push(entry);
+      }
+
+      // Characters from strumlines. Codename only spawns characters that
+      // have a strumline - a song without a girlfriend strumline has NO
+      // girlfriend. V-Slice shares that convention: girlfriend == '' means
+      // the GF is skipped entirely (see PlayState.initCharacters).
+      var chart0:Dynamic = util.readJson('$songBase/charts/${difficulties[0]}.json');
+      var playerChar:String = 'bf';
+      var opponentChar:String = 'dad';
+      var gfChar:String = '';
+      var hasGfLine:Bool = false;
+      if (chart0 != null)
+      {
+        // Legacy/psych charts declare characters directly.
+        if (get(chart0, 'player1') != null)
+        {
+          playerChar = Std.string(get(chart0, 'player1'));
+        }
+        if (get(chart0, 'player2') != null)
+        {
+          opponentChar = Std.string(get(chart0, 'player2'));
+        }
+        var gfRaw:Dynamic = get(chart0, 'gfVersion');
+        if (gfRaw != null)
+        {
+          gfChar = Std.string(gfRaw);
+          hasGfLine = true;
+        }
+        var lines:Array<Dynamic> = get(chart0, 'strumLines');
+        if (lines != null)
+        {
+          for (sl in 0...lines.length)
+          {
+            var line:Dynamic = lines[sl];
+            if (line == null) continue;
+            var lineType:Int = util.getInt(get(line, 'type'), 0);
+            var chars:Dynamic = get(line, 'characters');
+            if (chars != null && chars.length > 0)
+            {
+              var first:String = Std.string(chars[0]);
+              // Codename resolves the character slot from the strumline's
+              // `position` STRING ("boyfriend"/"girlfriend"/"dad") and only
+              // falls back to `type` when position is absent - a GF line can
+              // carry type 0 (e.g. gumballs' "memory card"), so keying off
+              // type alone would clobber the opponent with the gf character.
+              var slot:String = strumlineCharSlot(line, lineType);
+              if (slot == 'boyfriend')
+              {
+                playerChar = first;
+              }
+              else if (slot == 'girlfriend')
+              {
+                gfChar = first;
+                hasGfLine = true;
+              }
+              else
+              {
+                opponentChar = first;
+              }
+            }
+          }
+        }
+      }
+      // No usable gf anywhere in the chart: emit an empty girlfriend so
+      // V-Slice doesn't spawn a default GF on stages that have an anchor.
+      if (!hasGfLine) gfChar = '';
+
+      // Apply built-in collisions (a mod-defined 'gf-car' must not resolve to
+      // the vanilla character).
+      playerChar = resolveCharId(dir, playerChar);
+      opponentChar = resolveCharId(dir, opponentChar);
+      if (gfChar != '') gfChar = resolveCharId(dir, gfChar);
+
+      var stageId:String = 'mainStage';
+      var stageBaseId:String = '';
+      if (chart0 != null)
+      {
+        var stageVal:String = util.getString(get(chart0, 'stage'), '');
+        if (stageVal != null && stageVal != '')
+        {
+          stageId = stageVal;
+          // Canonical form: the chart's reference is what the runtime fetches
+          // (StageRegistry.fetchEntry is a raw map lookup), and stage
+          // conversion keys match by lowercased file name - so lowercase BOTH
+          // sides here. The vanilla 'mainStage' fallback keeps its casing.
+          stageId = stageId.toLowerCase();
+        }
+      }
+      stageBaseId = stageId;
+      // A stage also defined by an earlier imported mod would fight for the
+      // same registry entry and stage-art cache keys. Namespace it and key
+      // every emitted stage asset under the new id (see convertStages).
+      if (stageId != '' && stageId != 'mainStage')
+      {
+        stageId = resolveStageId(dir, stageId);
+      }
+      if (stageId != '') set(usedStageIds, stageId, true);
+
+      // Square/4:3-era mods framed their stages for a narrower view. The
+      // framed width comes from an explicit config override (modAspects /
+      // stageBias.<id>.aspect) or, when unset, from the automatically
+      // detected stage-layout signature (detectStageAspect). Emit a
+      // FunkyCompatAspect event at t=0 that pillar-boxes the world camera
+      // to that width; the scripted event class ships with the layer mod.
+      var aspectW:Int = util.aspectViewW(dir, [stageId, stageBaseId]);
+      if (aspectW <= 0) aspectW = this.detectedAspect;
+      if (aspectW > 0 && aspectW < 1280)
+      {
+        flatEvents.push({t: 0, e: 'FunkyCompatAspect', v: {w: aspectW, h: 720}});
+        util.warn('Codename: song "$songId" uses a non-16:9 stage ("$stageId", view ${aspectW}x720) - emitting aspect re-framing event');
+      }
+
+      var displayName:String = util.getString(get(metaJson, 'displayName'), songId);
+
+      // Custom note styles: Codename charts carry a noteStyle string; the
+      // mod's notes/splashes assets are swept from images/ notes and splashes
+      // folders. Default to the vanilla skin.
+      var noteStyle:String = 'funkin';
+      if (chart0 != null)
+      {
+        var nsRaw:Dynamic = get(chart0, 'noteStyle');
+        if (nsRaw != null && Std.string(nsRaw) != '') noteStyle = Std.string(nsRaw);
+      }
+      if (noteStyle == 'default') noteStyle = 'funkin';
+
+      var ratings:Dynamic = {};
+      for (di in 0...diffIds.length)
+      {
+        set(ratings, diffIds[di], 0);
+      }
+
+      var needsVoices:Bool = util.getBool(get(metaJson, 'needsVoices'), true);
+
+      // Per-character vocal tracks (Psych-style Voices-<name>.ogg, which
+      // dual-format mods like awesomemod ship instead of a single
+      // Voices.ogg). Register each under its own key; V-Slice will then play
+      // every track through the player voice list. Falls back to the
+      // character id when no per-char vocals exist (single combined track).
+      var voiceNames:Array<String> = registerCodenameVoices(dir, songFolder, emitId, out);
+      var playerVocals:Array<String> = (voiceNames.length > 0) ? voiceNames : [playerChar];
+      var opponentVocals:Array<String> = (voiceNames.length > 0) ? [] : [opponentChar];
+
+      var metadata:Dynamic = {
+        version: '2.2.4',
+        songName: displayName,
+        artist: 'Unknown',
+        charter: 'funky-compat import',
+        generatedBy: 'funky-compat (codename import)',
+        playData: {
+          difficulties: diffIds,
+          characters: {
+            player: playerChar,
+            opponent: opponentChar,
+            girlfriend: gfChar,
+            playerVocals: playerVocals,
+            opponentVocals: opponentVocals
+          },
+          stage: stageId,
+          noteStyle: noteStyle,
+          ratings: ratings
+        },
+        timeChanges: timeChanges
+      };
+
+      var chartData:Dynamic = {
+        version: '2.0.0',
+        scrollSpeed: scrollSpeeds,
+        events: flatEvents,
+        notes: notesJson,
+        generatedBy: 'funky-compat (codename import)'
+      };
+
+      addText(out, util.dataTextKeys('songs/$emitId/$emitId-metadata.json'), util.stringify(metadata));
+      addText(out, util.dataTextKeys('songs/$emitId/$emitId-chart.json'), util.stringify(chartData));
+
+      // Remember which characters the first song uses on this stage, so the
+      // stage converter knows which sprites its anchors describe.
+      if (stageId != '' && get(stageCharHints, stageId) == null)
+      {
+        set(stageCharHints, stageId, {bf: playerChar, dad: opponentChar, gf: gfChar});
+      }
+
+      // Collect create()-time sprite visibility overrides from this song's
+      // scripts (the "hidethings" pattern) for the stage it uses.
+      if (stageId != '' && get(stageSpritePatch, stageId) == null)
+      {
+        var patch:Dynamic = {};
+        var scriptFiles:Array<String> = util.listDir('$songBase/scripts');
+        var scriptTexts:Array<String> = [];
+        for (scriptFile in scriptFiles)
+        {
+          if (!StringTools.endsWith(scriptFile.toLowerCase(), '.hx')) continue;
+          var scriptText:String = util.readText('$songBase/scripts/$scriptFile');
+          scriptTexts.push(scriptText);
+          var overrides:Dynamic = scriptSpriteOverrides(scriptText);
+          for (key in ReflectUtil.fields(overrides))
+          {
+            var spriteName:String = Std.string(key);
+            if (get(patch, spriteName) == null) set(patch, spriteName, get(overrides, spriteName));
+          }
+        }
+        // Intro/flash sprites that are VISIBLE at create() but hidden a few
+        // seconds into the song (e.g. backrooms' Kane logo fade-black) would
+        // linger forever because the HScript Call events that fade them cannot
+        // run here. If a stage sprite is hidden ONLY by script functions that
+        // are called within the first third of the song, default it to hidden
+        // too - keeps intro overlays off the screen without hiding scene-
+        // transition props (basement etc.) that stay up most of the song.
+        var songLenMs:Float = 0;
+        for (ev in globalEvents)
+        {
+          if (ev == null) continue;
+          var et:Float = util.getFloat(get(ev, 'time'), 0);
+          if (et > songLenMs) songLenMs = et;
+        }
+        var introHides:Dynamic = scriptIntroHides(scriptTexts, globalEvents, songLenMs);
+        for (key2 in ReflectUtil.fields(introHides))
+        {
+          var spriteName2:String = Std.string(key2);
+          if (get(patch, spriteName2) == null) set(patch, spriteName2, get(introHides, spriteName2));
+        }
+        set(stageSpritePatch, stageId, patch);
+      }
+
+      addCodenameAudio(dir, songFolder, emitId, playerChar, opponentChar, metaJson, out);
+
+      // Only characters actually used as the player are selectable.
+      if (playerChar != null && playerChar != '' && out.playerChars.indexOf(playerChar) == -1)
+      {
+        out.playerChars.push(playerChar);
+      }
+
+      out.songs.push(emitId);
+      util.claimForeign('songs', emitId);
+    }
+  }
+
+  // Scan the song's audio folder for per-character vocal files
+  // (Voices-<name>.ogg / Voices-<name>.mp3) and register each under its own
+  // song-audio key so V-Slice's voice resolution can find them. Returns the
+  // lowercased vocal names that were registered (empty when only a combined
+  // Voices.ogg exists - that path stays on addCodenameAudio).
+  public function registerCodenameVoices(dir:String, folder:String, songId:String, out:Dynamic):Array<String>
+  {
+    var result:Array<String> = [];
+    var audioBase:String = 'mods/$dir/songs/$folder/song';
+    if (!util.pathExists(audioBase)) return result;
+    var voices:Array<Dynamic> = util.scanVoiceFiles(out, audioBase);
+    for (v in voices)
+    {
+      var name:String = util.getString(get(v, 'name'), '');
+      if (name == '') continue;
+      addSound(out, util.songAudioKeys(songId, 'Voices-$name.ogg'), get(v, 'entry'));
+      addSound(out, util.songAudioKeys(songId, 'Voices-$name.mp3'), get(v, 'entry'));
+      result.push(name);
+    }
+    return result;
+  }
+
+  // Namespace a stage id that an earlier imported mod already claimed.
+  // Deterministic with convertStages (ids are only claimed by earlier mods).
+  public function resolveStageId(dir:String, stageId:String):String
+  {
+    if (stageId == null || stageId == '') return stageId;
+    if (util.isForeignTaken('stages', stageId))
+    {
+      var renamed:String = stageId + '-' + util.modSlug(dir);
+      util.warn('Codename: stage "$stageId" is also defined by another imported mod - importing this mod version as "$renamed"');
+      return renamed;
+    }
+    return stageId;
+  }
+
+  // Map codename events to vslice events.
+  public function mapEvents(raw:Array<Dynamic>, songId:String, diff:String, timeChangeOut:Array<Dynamic>):Array<Dynamic>
+  {
+    var result:Array<Dynamic> = [];
+    for (ei in 0...raw.length)
+    {
+      var ev:Dynamic = raw[ei];
+      if (ev == null) continue;
+      var name:String = util.getString(get(ev, 'name'), '');
+      var t:Float = util.getFloat(get(ev, 'time'), 0);
+      var params:Array<Dynamic> = get(ev, 'params');
+      if (params == null) params = [];
+
+      if (name == 'BPM Change')
+      {
+        if (params.length > 0)
+        {
+          timeChangeOut.push({t: t, bpm: util.getFloat(params[0], 100)});
+        }
+        continue;
+      }
+      if (name == 'Time Signature Change')
+      {
+        var num:Int = 4;
+        var den:Int = 4;
+        if (params.length > 0) num = util.getInt(params[0], 4);
+        if (params.length > 1) den = util.getInt(params[1], 4);
+        timeChangeOut.push({t: t, bpm: -1, bt: [num, den, num, den]});
+        continue;
+      }
+      if (name == 'Camera Movement')
+      {
+        // Codename targets the STRUMLINE (0 = dad/opponent, 1 = player,
+        // 2 = girlfriend); V-Slice's FocusCamera uses its own char enum
+        // (0 = player, 1 = opponent/dad, 2 = girlfriend) - swap 0 and 1.
+        var charIdx:Int = 1;
+        if (params.length > 0) charIdx = util.getInt(params[0], 1);
+        if (charIdx == 1) charIdx = 0;
+        else if (charIdx == 0) charIdx = 1;
+        // Duration is in steps (time change in params[2]).
+        var duration:Float = 4;
+        if (params.length > 2) duration = Math.max(0.25, util.getFloat(params[2], 4));
+        var ease:String = 'CLASSIC';
+        var easeDir:String = 'In';
+        if (params.length > 3 && params[3] != null && Std.string(params[3]).toLowerCase() != 'classic')
+        {
+          ease = mapEaseName(Std.string(params[3]));
+          if (params.length > 4) easeDir = Std.string(params[4]);
+        }
+        result.push({t: t, e: 'FocusCamera', v: {char: charIdx, duration: duration, ease: ease, easeDir: easeDir}});
+        continue;
+      }
+      if (name == 'Camera Position')
+      {
+        // Codename params: [x, y, tween, time, ease, easeDir, isOffset].
+        // Absolute positions map to V-Slice's static focus (char = -1);
+        // relative offsets depend on the live camera position so they can't
+        // be precomputed here.
+        if (params.length > 6 && params[6] == true)
+        {
+          util.warn('Codename: relative Camera Position skipped in $songId ($diff) (depends on live camera position)');
+        }
+        else if (params.length >= 2)
+        {
+          var px:Float = util.getFloat(params[0], 0);
+          var py:Float = util.getFloat(params[1], 0);
+          result.push({t: t, e: 'FocusCamera', v: {char: -1, x: px, y: py, duration: 2, ease: 'quad', easeDir: 'InOut'}});
+        }
+        continue;
+      }
+      if (name == 'Camera Zoom')
+      {
+        // Codename params: [tween?, zoom, camera, time(steps), ease, easeDir, mode, relative].
+        // When tween is false Codename snaps the zoom instantly.
+        var zoom:Float = 1;
+        var duration:Float = 4;
+        var ease:String = 'linear';
+        var easeDir:String = 'InOut';
+        if (params.length > 1) zoom = util.getFloat(params[1], 1);
+        if (params.length > 3) duration = Math.max(0.25, util.getFloat(params[3], 4));
+        if (params.length > 4) ease = mapEaseName(Std.string(params[4]));
+        if (params.length > 5) easeDir = Std.string(params[5]);
+        var shouldTween:Bool = true;
+        if (params.length > 0) shouldTween = util.getBool(params[0], true);
+        if (!shouldTween) duration = 0;
+        // Pass the codename mode through: 'direct' and 'stage' mean the same
+        // thing in V-Slice (zoom x defaultZoom / zoom x stageZoom).
+        var mode:String = 'direct';
+        if (params.length > 6 && Std.string(params[6]) == 'stage') mode = 'stage';
+        result.push({t: t, e: 'ZoomCamera', v: {zoom: zoom, duration: duration, ease: ease, easeDir: easeDir, mode: mode}});
+        continue;
+      }
+      if (name == 'Add Camera Zoom')
+      {
+        // Codename increments the CURRENT zoom (camera.zoom += amount). V-Slice
+        // has no increment event; approximate with a stage-relative step so the
+        // direction and rough magnitude match the modest in/out panning intent.
+        var amount:Float = 0.015;
+        if (params.length > 0) amount = util.getFloat(params[0], 0.015);
+        result.push({t: t, e: 'ZoomCamera', v: {zoom: 1 + amount, duration: 1, ease: 'linear', easeDir: 'InOut', mode: 'direct'}});
+        continue;
+      }
+      if (name == 'Set Camera Zoom')
+      {
+        // Codename: instant absolute zoom (params: [zoom, tween?, duration?]).
+        var zoom:Float = 1;
+        if (params.length > 0) zoom = util.getFloat(params[0], 1);
+        result.push({t: t, e: 'ZoomCamera', v: {zoom: zoom, duration: 0, ease: 'linear', easeDir: 'InOut', mode: 'direct'}});
+        continue;
+      }
+      if (name == 'Tween Camera')
+      {
+        // Codename: params [target, value, duration(steps), ease, easeDir].
+        // Only the zoom variant is portable; position tweens are skipped.
+        var tweenTarget:String = params.length > 0 ? Std.string(params[0]) : '';
+        if (tweenTarget != null && tweenTarget.toLowerCase() == 'zoom' && params.length > 1)
+        {
+          var zoom:Float = util.getFloat(params[1], 1);
+          var duration:Float = 4;
+          if (params.length > 2) duration = Math.max(0.25, util.getFloat(params[2], 4));
+          var ease:String = 'linear';
+          var easeDir:String = 'InOut';
+          if (params.length > 3) ease = mapEaseName(Std.string(params[3]));
+          if (params.length > 4) easeDir = Std.string(params[4]);
+          result.push({t: t, e: 'ZoomCamera', v: {zoom: zoom, duration: duration, ease: ease, easeDir: easeDir, mode: 'direct'}});
+        }
+        else
+        {
+          util.warn('Codename: non-zoom Tween Camera skipped in $songId ($diff)');
+        }
+        continue;
+      }
+      if (name == 'Camera Bop')
+      {
+        var intensity:Float = 1;
+        if (params.length > 0) intensity = util.getFloat(params[0], 1);
+        result.push({t: t, e: 'SetCameraBop', v: {rate: 1, offset: 0, intensity: intensity}});
+        continue;
+      }
+      if (name == 'Scroll Speed Change')
+      {
+        var scroll:Float = 1;
+        var duration:Float = 4;
+        var abs:Bool = true;
+        if (params.length > 1) scroll = util.getFloat(params[1], 1);
+        if (params.length > 2) duration = Math.max(0.25, util.getFloat(params[2], 4));
+        result.push({t: t, e: 'ScrollSpeed', v: {scroll: scroll, duration: duration, absolute: abs, strumline: 'both'}});
+        continue;
+      }
+      if (name == 'Camera Position')
+      {
+        var x:Float = 0;
+        var y:Float = 0;
+        var isOffset:Bool = false;
+        if (params.length > 0) x = util.getFloat(params[0], 0);
+        if (params.length > 1) y = util.getFloat(params[1], 0);
+        if (params.length > 6) isOffset = util.getBool(params[6], false);
+        result.push({t: t, e: 'FocusCamera', v: {char: -1, x: x, y: y, offset: isOffset}});
+        continue;
+      }
+      if (name == 'Play Animation')
+      {
+        var target:String = 'boyfriend';
+        var anim:String = 'idle';
+        var force:Bool = true;
+        if (params.length > 0) target = strumlineName(util.getInt(params[0], 1));
+        if (params.length > 1) anim = Std.string(params[1]);
+        if (params.length > 2) force = util.getBool(params[2], true);
+        result.push({t: t, e: 'PlayAnimation', v: {target: target, anim: anim, force: force}});
+        continue;
+      }
+      if (name != 'Alt Animation Toggle' && name != 'HScript Call' && name != 'Camera Flash' && name != 'Fancy Camera Flash'
+        && name != 'Camera Modulo Change' && name != 'Move Strumline' && name != 'Cinematics' && name != 'camera_captain')
+      {
+        util.warn('Codename: unhandled event "$name" in $songId ($diff)');
+      }
+    }
+    return result;
+  }
+
+  public function strumlineName(idx:Int):String
+  {
+    if (idx == 0) return 'dad';
+    if (idx == 2) return 'girlfriend';
+    return 'boyfriend';
+  }
+
+  // V-Slice chart events are a single flat array shared by every difficulty
+  // (SongChartData.events). Codename charts carry per-difficulty events, so
+  // merge them all and drop exact duplicates (e.g. the same global event
+  // appearing in each difficulty's list).
+  public function appendUnique(target:Array<Dynamic>, seen:Dynamic, items:Array<Dynamic>):Void
+  {
+    if (items == null) return;
+    for (item in items)
+    {
+      if (item == null) continue;
+      var key:String = Std.string(get(item, 't')) + '|' + Std.string(get(item, 'e')) + '|' + util.stringify(get(item, 'v'));
+      if (get(seen, key) == true) continue;
+      set(seen, key, true);
+      target.push(item);
+    }
+  }
+
+  // Map a Codename difficulty name to a V-Slice difficulty id: lowercase,
+  // non-alphanumerics collapsed to single hyphens ("Normal-Erect" ->
+  // "normal-erect"). The base ids easy/normal/hard/erect/nightmare come out
+  // identical to the game's built-in ids, so the freeplay difficulty filter
+  // matches them.
+  public function vsliceDiffId(raw:String):String
+  {
+    if (raw == null) return '';
+    var lower:String = raw.toLowerCase();
+    var out:String = '';
+    var pendingDash:Bool = false;
+    for (i in 0...lower.length)
+    {
+      var ch:String = lower.charAt(i);
+      var ok:Bool = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+      if (ok)
+      {
+        if (pendingDash && out != '') out += '-';
+        pendingDash = false;
+        out += ch;
+      }
+      else
+      {
+        pendingDash = true;
+      }
+    }
+    return out;
+  }
+
+  public function isPrimitive(v:Dynamic):Bool
+  {
+    return (v == null || Std.isOfType(v, String) || Std.isOfType(v, Float) || Std.isOfType(v, Int) || v == true || v == false);
+  }
+
+  // Legacy psych-format sections -> vslice notes + time changes.
+  public function convertLegacyChart(song:Dynamic, startBpm:Float, notesOut:Array<Dynamic>, eventsOut:Array<Dynamic>, timeChangesOut:Array<Dynamic>):Void
+  {
+    var sections:Array<Dynamic> = get(song, 'notes');
+    if (sections == null) return;
+
+    var currentBpm:Float = startBpm;
+    var currentTime:Float = 0.0;
+    var currentBeat:Float = 0.0;
+    var lastCamChar:Int = -99;
+
+    // Same old-format detection as the Psych importer: OLD-format charts
+    // (17Bucks-style) keep the whole melody on data 0-3 and let mustHitSection
+    // flip which side is the player's - the 4-7 lane is barely used. MODERN
+    // psych charts author a full opponent part on 4-7 (comparable note counts
+    // to the 0-3 lane), so flipping those would swap the opponent's part onto
+    // the player's side. Flip only when 4-7 carries clearly the minority of
+    // the chart (below 75% of the 0-3 count; all classic charts sit well
+    // under, modern ones near/above parity - e.g. GUNLICK's philly nice).
+    var flipSections:Bool = false;
+    var totalLow:Int = 0;
+    var totalHigh:Int = 0;
+    for (se0 in sections)
+    {
+      if (se0 == null) continue;
+      var sn0:Array<Dynamic> = get(se0, 'sectionNotes');
+      if (sn0 == null) continue;
+      for (ni1 in 0...sn0.length)
+      {
+        var nd0:Int = util.getInt(sn0[ni1][1], 0);
+        if (nd0 >= 4) totalHigh++; else totalLow++;
+      }
+    }
+    if (totalLow > 0 && totalHigh < totalLow * 0.75) flipSections = true;
+
+    for (si in 0...sections.length)
+    {
+      var section:Dynamic = sections[si];
+      if (section == null) continue;
+
+      var beats:Int = util.getInt(get(section, 'sectionBeats'), 4);
+      if (beats <= 0) beats = 4;
+
+      var changeBpm:Bool = util.getBool(get(section, 'changeBPM'), false);
+      var newBpm:Float = util.getFloat(get(section, 'bpm'), currentBpm);
+      if (changeBpm && newBpm > 0)
+      {
+        timeChangesOut.push({t: currentTime, b: currentBeat, bpm: newBpm, bt: [4, 4, 4, 4]});
+        currentBpm = newBpm;
+      }
+
+      // Classic Psych charts drive the CAMERA from mustHitSection instead of
+      // chart events - emit a FocusCamera event at each section boundary
+      // (0 = bf, 1 = dad) so V-Slice follows the source engine's focus.
+      var camChar:Int = util.getBool(get(section, 'mustHitSection'), false) ? 0 : 1;
+      if (camChar != lastCamChar)
+      {
+        eventsOut.push({t: currentTime, e: 'FocusCamera', v: {char: camChar, duration: 2, ease: 'sine', easeDir: 'InOut'}});
+        lastCamChar = camChar;
+      }
+
+      var sectionNotes:Array<Dynamic> = get(section, 'sectionNotes');
+      if (sectionNotes != null)
+      {
+        for (ni in 0...sectionNotes.length)
+        {
+          var note:Dynamic = sectionNotes[ni];
+          if (note == null) continue;
+          var t:Float = util.getFloat(note[0], 0);
+          var d:Int = util.getInt(note[1], 0);
+          var sus:Float = util.getFloat(note[2], 0);
+          // Per-note psych types (defaultNoteTypes): 4 = 'GF Sing' (the
+          // girlfriend sings this note), 5 = 'No Animation'.
+          var noteType:Null<String> = null;
+          if (note.length > 3 && get(note, 3) != null)
+          {
+            var ntr:Dynamic = get(note, 3);
+            if (Std.isOfType(ntr, Int) || Std.isOfType(ntr, Float))
+            {
+              switch (util.getInt(ntr, 0))
+              {
+                case 4: noteType = 'GF Sing';
+                case 5: noteType = 'No Animation';
+              }
+            }
+            else noteType = Std.string(ntr);
+          }
+          // Both engines use the same lane convention: noteData < 4 is the
+          // PLAYER's strumline (Psych: mustPress = data < 4; V-Slice:
+          // getStrumlineIndex = floor(data/4), 0 = player). Old-format charts
+          // flip the player side with mustHitSection, so remap per section.
+          var vsliceD:Int = d;
+          if (flipSections && !util.getBool(get(section, 'mustHitSection'), false))
+          {
+            vsliceD = (d + 4) % 8;
+          }
+          // Psych gfNote mechanic: in gfSection sections the notes on the
+          // must-hit side are sung by the girlfriend - animate the gf slot.
+          if (noteType == 'GF Sing' || (util.getBool(get(section, 'gfSection'), false) && util.getBool(get(section, 'mustHitSection'), false) == (d < 4)))
+          {
+            var gfAnim:String = 'singRIGHT';
+            switch (d % 4)
+            {
+              case 0: gfAnim = 'singLEFT';
+              case 1: gfAnim = 'singDOWN';
+              case 2: gfAnim = 'singUP';
+            }
+            eventsOut.push({t: t, e: 'PlayAnimation', v: {target: 'gf', anim: gfAnim, force: true}});
+          }
+          var noteObj:Dynamic = {t: t, d: vsliceD};
+          if (sus > 0) noteObj.l = sus;
+          if (noteType == 'No Animation') noteObj.k = 'noanim';
+          notesOut.push(noteObj);
+        }
+      }
+
+      var beatMs:Float = 60000.0 / currentBpm;
+      currentTime += beats * beatMs;
+      currentBeat += beats;
+    }
+  }
+
+  // Legacy psych event tuples (time, [[name, v1, v2], ...]) -> vslice events.
+  public function convertLegacyEvents(rawEvents:Dynamic):Array<Dynamic>
+  {
+    var result:Array<Dynamic> = [];
+    if (rawEvents == null) return result;
+    for (ei in 0...rawEvents.length)
+    {
+      var entry:Dynamic = rawEvents[ei];
+      if (entry == null) continue;
+      var t:Float = util.getFloat(entry[0], 0);
+      var list:Dynamic = entry[1];
+      if (list == null) continue;
+      for (ii in 0...list.length)
+      {
+        var item:Dynamic = list[ii];
+        if (item == null) continue;
+        var name:String = util.getString(item[0], '');
+        var converted:Null<Dynamic> = mapLegacyEvent(name, item[1], item[2]);
+        if (converted != null)
+        {
+          converted.t = t;
+          result.push(converted);
+        }
+      }
+    }
+    return result;
+  }
+
+  public function mapLegacyEvent(name:String, v1:Dynamic, v2:Dynamic):Null<Dynamic>
+  {
+    if (name == 'Set Camera Target')
+    {
+      var char:Int = 1;
+      if (v1 == null) char = 1;
+      else if (Std.isOfType(v1, Int) || Std.isOfType(v1, Float)) char = util.getInt(v1, 1);
+      else
+      {
+        var raw:String = Std.string(v1).toLowerCase();
+        if (raw == 'dad' || raw == 'opponent') char = 0;
+        if (raw == 'gf' || raw == 'girlfriend') char = 2;
+      }
+      return {e: 'FocusCamera', v: {char: char}};
+    }
+    if (name == 'Set Camera Zoom')
+    {
+      var zoom:Float = util.getFloat(v1, 1);
+      var duration:Float = 4;
+      if (v2 != null)
+      {
+        var parts:Array<String> = Std.string(v2).split(',');
+        var dur:Float = Std.parseFloat(StringTools.trim(parts[0]));
+        if (!Math.isNaN(dur)) duration = dur;
+      }
+      return {e: 'ZoomCamera', v: {zoom: zoom, duration: duration, ease: 'linear', mode: 'direct'}};
+    }
+    if (name == 'Hey!')
+    {
+      var target:String = 'boyfriend';
+      var raw:String = Std.string(v1).toLowerCase();
+      if (raw == 'dad' || raw == 'opponent') target = 'dad';
+      if (raw == 'gf' || raw == 'girlfriend') target = 'girlfriend';
+      return {e: 'PlayAnimation', v: {target: target, anim: 'hey', force: true}};
+    }
+    return null;
+  }
+
+  public function mapEaseName(nameRaw:String):String
+  {
+    var name:String = nameRaw.toLowerCase();
+    // Codename tween ease names overlap with flixel's.
+    if (name == 'classic') return 'linear';
+    if (name == 'sine' || name == 'sinein') return 'sineIn';
+    if (name == 'sineout') return 'sineOut';
+    if (name == 'sineinout') return 'sineInOut';
+    if (name == 'quad' || name == 'quadin') return 'quadIn';
+    if (name == 'quadout') return 'quadOut';
+    if (name == 'quadinout') return 'quadInOut';
+    if (name == 'expoin') return 'expoIn';
+    if (name == 'expoout') return 'expoOut';
+    if (name == 'expoinout') return 'expoInOut';
+    if (name == 'cubicin') return 'cubeIn';
+    if (name == 'cubicout' || name == 'cubeout') return 'cubeOut';
+    if (name == 'cubicinout' || name == 'cubeinout') return 'cubeInOut';
+    return name;
+  }
+
+  public function addCodenameAudio(dir:String, folder:String, songId:String, player:String, opponent:String, meta:Dynamic, out:Dynamic):Void
+  {
+    var songBase:String = 'mods/$dir/songs/$folder/song';
+
+    var instSuffix:String = util.getString(get(meta, 'instSuffix'), '');
+    var instFile:String = 'Inst.ogg';
+    if (instSuffix != null && instSuffix != '') instFile = 'Inst-$instSuffix.ogg';
+    var instEntry:Dynamic = util.resolveFileEntry(out, '$songBase/$instFile');
+    if (instEntry == null && instFile != 'Inst.ogg')
+    {
+      instSuffix = '';
+      instFile = 'Inst.ogg';
+      instEntry = util.resolveFileEntry(out, '$songBase/Inst.ogg');
+    }
+    if (instEntry == null) instEntry = util.resolveFileEntry(out, '$songBase/Inst.mp3');
+    if (instEntry != null)
+    {
+      addSound(out, util.songAudioKeys(songId, 'Inst.ogg'), instEntry);
+      if (instFile != 'Inst.ogg')
+      {
+        addSound(out, util.songAudioKeys(songId, instFile), instEntry);
+      }
+    }
+
+    var vocalsSuffix:String = util.getString(get(meta, 'vocalsSuffix'), '');
+    var voicesFile:String = 'Voices.ogg';
+    if (vocalsSuffix != null && vocalsSuffix != '') voicesFile = 'Voices-$vocalsSuffix.ogg';
+    var voicesEntry:Dynamic = util.resolveFileEntry(out, '$songBase/$voicesFile');
+    if (voicesEntry == null && voicesFile != 'Voices.ogg') voicesEntry = util.resolveFileEntry(out, '$songBase/Voices.ogg');
+    if (voicesEntry != null)
+    {
+      addSound(out, util.songAudioKeys(songId, 'Voices-$player.ogg'), voicesEntry);
+      addSound(out, util.songAudioKeys(songId, 'Voices-$opponent.ogg'), voicesEntry);
+      addSound(out, util.songAudioKeys(songId, 'Voices.ogg'), voicesEntry);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Characters (XML -> JSON)
+  // ------------------------------------------------------------------
+
+  public function convertCharacters(dir:String, out:Dynamic):Void
+  {
+    var charsRoot:String = 'mods/$dir/data/characters';
+    if (!util.pathExists(charsRoot)) return;
+    var charFiles:Array<String> = util.listDir(charsRoot);
+    for (charFile in charFiles)
+    {
+      if (!StringTools.endsWith(charFile.toLowerCase(), '.xml')) continue;
+      // Raw base name = on-disk file -> also the sprite sheet's default name.
+      // resolveCharId may rename the CHARACTER id (e.g. 'bf' -> 'bf-fc') to
+      // dodge a built-in collision, but the SPRITE folder keeps the raw name.
+      var rawCharId:String = charFile.substring(0, charFile.length - 4);
+      charId = resolveCharId(dir, rawCharId);
+      var xmlText:String = util.readText('$charsRoot/$charFile');
+      if (xmlText == null) continue;
+
+      var root:String = extractFirstTag(xmlText, 'character');
+      var spriteName:String = attr(root, 'sprite');
+      if (spriteName == null || spriteName == '') spriteName = rawCharId;
+
+      // When the character id was namespaced (built-in or cross-mod
+      // collision) the sprite art must be re-keyed too: the shared cache
+      // keeps ONE 'characters/<name>.xml/.png' per path, so two mods mustn't
+      // both register under the raw sprite name. The frames inside the
+      // atlas (and thus the sprite's default name) stay the raw one.
+      var artBase:String = spriteName;
+      if (charId != rawCharId) artBase = spriteName + charId.substring(rawCharId.length);
+
+      // Codename multi-spritesheet characters: the sprite value is a FOLDER
+      // (images/characters/<sprite>/1.png+1.xml, 2.png+2.xml, ...) whose
+      // numbered atlases Codename concatenates into one character (its
+      // Path.loadFrames scans '<path>/1.png', '<path>/2.png', ...). V-Slice's
+      // MultiSparrowCharacter mirrors this: a primary sparrow atlas plus
+      // per-animation sub-atlases (combineAtlas). Sheet 1 becomes the primary
+      // atlas; every other sheet is attached to the animations whose frame
+      // prefixes live there.
+      var multiSheets:Array<String> = [];
+      var sheetScan:Int = 1;
+      while (util.pathExists('mods/$dir/images/characters/$spriteName/$sheetScan.xml'))
+      {
+        multiSheets.push(Std.string(sheetScan));
+        sheetScan++;
+      }
+      var isMultiSparrow:Bool = multiSheets.length > 1;
+      var sheetTexts:Dynamic = {};
+      if (isMultiSparrow)
+      {
+        for (msi in 0...multiSheets.length)
+        {
+          set(sheetTexts, multiSheets[msi], util.readText('mods/$dir/images/characters/$spriteName/${multiSheets[msi]}.xml'));
+        }
+      }
+
+      var animations:Array<Dynamic> = [];
+      var animBodies:Array<String> = extractTags(xmlText, 'anim');
+      for (ai in 0...animBodies.length)
+      {
+        var body:String = animBodies[ai];
+        var animOut:Dynamic = {
+          name: attr(body, 'name'),
+          prefix: attr(body, 'anim'),
+          frameRate: parseIntAttr(body, 'fps', 24),
+          looped: boolAttr(body, 'loop', false)
+        };
+        var ax:Int = parseIntAttr(body, 'x', 0);
+        var ay:Int = parseIntAttr(body, 'y', 0);
+        if (ax != 0 || ay != 0)
+        {
+          animOut.offsets = [ax, ay];
+        }
+        var indicesRaw:String = attr(body, 'indices');
+        if (indicesRaw != null && indicesRaw != '')
+        {
+          animOut.frameIndices = expandIndices(indicesRaw);
+        }
+        if (animOut.name == null || animOut.name == '') animOut.name = 'idle';
+        if (animOut.prefix == null || animOut.prefix == '') animOut.prefix = animOut.name;
+        if (isMultiSparrow)
+        {
+          // Route this animation to the numbered sheet that contains its
+          // frame prefix (defaults to sheet 1 = the primary atlas).
+          for (msi in 0...multiSheets.length)
+          {
+            var sidx:String = multiSheets[msi];
+            if (sidx == '1') continue;
+            var sheetText:String = Std.string(get(sheetTexts, sidx));
+            if (sheetText != null && sheetText != '' && xmlHasPrefix(sheetText, Std.string(animOut.prefix)))
+            {
+              animOut.assetPath = 'characters/$artBase/$sidx';
+              break;
+            }
+          }
+        }
+        animations.push(animOut);
+      }
+
+      var charData:Dynamic = {
+        version: '1.0.1',
+        name: charId,
+        renderType: 'sparrow',
+        // NOTE: no 'shared:' prefix - SparrowCharacter passes assetPath
+        // straight into Paths.getSparrowAtlas(), which resolves it against
+        // the shared AND preload key forms we cache.
+        assetPath: 'characters/$artBase',
+        scale: floatAttr(root, 'scale', 1),
+        flipX: boolAttr(root, 'flipX', false),
+        // Codename uses antialiasing="false" for pixel characters.
+        isPixel: boolAttr(root, 'antialiasing', true) == false,
+        // Codename's root x/y are globalOffset, applied as a flixel OFFSET
+        // (offset.x *= (isPlayer != playerOffsets ? 1 : -1), offset.y = -y)
+        // which moves the GRAPHIC opposite the sprite position. V-Slice's
+        // offsets are globalOffsets, added TO the position - the opposite
+        // semantics. Zero them here and bake the effect into each stage
+        // anchor instead (see placeAnchor).
+        offsets: [0, 0],
+        cameraOffsets: [parseIntAttr(root, 'camx', 0), parseIntAttr(root, 'camy', 0)],
+        singTime: floatAttr(root, 'holdTime', 8),
+        danceEvery: floatAttr(root, 'interval', 1),
+        animations: animations
+      };
+      if (isMultiSparrow)
+      {
+        set(charData, 'renderType', 'multisparrow');
+        set(charData, 'assetPath', 'characters/$artBase/1');
+      }
+
+      addText(out, util.dataTextKeys('characters/$charId.json'), util.stringify(charData));
+      out.chars.push(charId);
+      util.claimForeign('chars', charId);
+
+      // Frame dimensions + base scale for stage anchor conversion. Prefer
+      // the IDLE frame's size: the character rests on the idle animation, so
+      // the feet line (and the stage anchor) follows it, not the first
+      // (often a sing) sub-texture.
+      var fw:Float = 640;
+      var fh:Float = 640;
+      var fw0:Float = 640;
+      var fh0:Float = 640;
+      var atlasText:String;
+      if (isMultiSparrow)
+      {
+        atlasText = Std.string(get(sheetTexts, '1'));
+      }
+      else
+      {
+        atlasText = util.readText('mods/$dir/images/characters/$spriteName.xml');
+      }
+      if (atlasText != null && atlasText != '')
+      {
+        var subs:Array<String> = extractTags(atlasText, 'SubTexture');
+        if (subs.length > 0)
+        {
+          // Codename's character HITBOX (which its getMidpoint() uses for the
+          // camera) stays on the FIRST sub-texture's source size.
+          var firstBw:Float = floatAttr(subs[0], 'frameWidth', 0);
+          var firstBh:Float = floatAttr(subs[0], 'frameHeight', 0);
+          if (firstBw <= 0) firstBw = floatAttr(subs[0], 'width', 0);
+          if (firstBh <= 0) firstBh = floatAttr(subs[0], 'height', 0);
+          if (firstBw > 0) fw0 = firstBw;
+          if (firstBh > 0) fh0 = firstBh;
+          var idleDims:Dynamic = idleFrameDims(subs);
+          var bw:Float = 0;
+          var bh:Float = 0;
+          // Characters without an 'idle' frame - use the first animation's
+          // frame prefix (usually the dance/idle pose).
+          if (idleDims == null && animations.length > 0)
+          {
+            var firstPref:String = util.getString(get(animations[0], 'prefix'), '');
+            if (firstPref != '') idleDims = prefixFrameDims(subs, firstPref);
+          }
+          if (idleDims != null)
+          {
+            bw = util.getFloat(get(idleDims, 'w'), 0);
+            bh = util.getFloat(get(idleDims, 'h'), 0);
+          }
+          else
+          {
+            bw = floatAttr(subs[0], 'frameWidth', 0);
+            bh = floatAttr(subs[0], 'frameHeight', 0);
+          }
+          if (bw <= 0) bw = floatAttr(subs[0], 'width', 0);
+          if (bh <= 0) bh = floatAttr(subs[0], 'height', 0);
+          if (bw > 0) fw = bw;
+          if (bh > 0) fh = bh;
+        }
+      }
+      set(charMetrics, charId, {
+        w: fw,
+        h: fh,
+        w0: fw0,
+        h0: fh0,
+        s: floatAttr(root, 'scale', 1),
+        // Root globalOffset (ox/oy) and XML isPlayer flag (op), needed to
+        // bake Codename's offset-based placement into V-Slice stage anchors.
+        ox: floatAttr(root, 'x', 0),
+        oy: floatAttr(root, 'y', 0),
+        op: boolAttr(root, 'isPlayer', false),
+        // Character-level camera offset (camx/camy). Stage scripts may
+        // REPLACE it (e.g. 'boyfriend.cameraOffset = FlxPoint.get(...)'), so
+        // the stage converter needs to know the original value to diff.
+        cx: parseIntAttr(root, 'camx', 0),
+        cy: parseIntAttr(root, 'camy', 0)
+      });
+
+      if (isMultiSparrow)
+      {
+        for (msi in 0...multiSheets.length)
+        {
+          var sheetN:String = multiSheets[msi];
+          addImage(out, dir, 'characters/$spriteName/$sheetN.png', 'characters/$artBase/$sheetN.png');
+        }
+      }
+      else
+      {
+        addImage(out, dir, 'characters/$spriteName.png', 'characters/$artBase.png');
+      }
+
+      // Alias the health icon under V-Slice's expected key. The icon LOOKUP
+      // name stays the mod's own (raw) value even when the character id was
+      // namespaced - only the registered key follows the renamed id.
+      var iconLookup:String = attr(root, 'icon');
+      if (iconLookup == null || iconLookup == '') iconLookup = rawCharId;
+      addIconAlias(out, dir, iconLookup, charId);
+    }
+  }
+
+  // A character id that the game also ships as built-in data
+  // (assets/data/characters/<id>.json, e.g. 'gf-car') would have the vanilla
+  // file win its asset-cache slot, so the mod's character would render as the
+  // built-in instead. Import such characters under a suffixed id and rewrite
+  // every reference (song metadata, stage hints) to match. Same for ids an
+  // EARLIER imported mod already claimed - the shared asset cache holds one
+  // entry per path, so a second mod's identically-named character would
+  // overwrite the first mod's art everywhere.
+  public function resolveCharId(dir:String, charId:String):String
+  {
+    if (charId == null || charId == '') return charId;
+    var finalized:String = charId;
+    if (util.fileExists('mods/$dir/data/characters/$charId.xml') && util.fileExists('assets/data/characters/$charId.json'))
+    {
+      util.warn('Codename: character "$charId" collides with a built-in V-Slice character - importing the mod version as "$charId-fc"');
+      finalized = charId + '-fc';
+    }
+    if (util.isForeignTaken('chars', finalized))
+    {
+      var renamed:String = finalized + '-' + util.modSlug(dir);
+      util.warn('Codename: character "$finalized" is also defined by another imported mod - importing this mod version as "$renamed"');
+      return renamed;
+    }
+    return finalized;
+  }
+
+  // True when any sub-texture name in the given sparrow xml starts with the
+  // frame prefix (used to route multi-spritesheet animations to their sheet).
+  public function xmlHasPrefix(xmlText:String, prefix:String):Bool
+  {
+    if (xmlText == null || prefix == null || prefix == '') return false;
+    var lowerToken:String = prefix.toLowerCase();
+    var subs:Array<String> = extractTags(xmlText, 'SubTexture');
+    for (sb in subs)
+    {
+      var nm:String = attr(sb, 'name');
+      if (nm != null && nm.toLowerCase().indexOf(lowerToken) == 0) return true;
+    }
+    return false;
+  }
+
+  // Find a sub-texture whose name starts with a prefix (the first
+  // animation's frame prefix) and return its frame dims.
+  public function prefixFrameDims(subs:Array<String>, prefix:String):Null<Dynamic>
+  {
+    if (prefix == null || prefix == '') return null;
+    var lowerPrefix:String = prefix.toLowerCase();
+    for (sb in subs)
+    {
+      var nm:String = attr(sb, 'name');
+      if (nm == null || nm.toLowerCase().indexOf(lowerPrefix) != 0) continue;
+      var bw:Float = floatAttr(sb, 'frameWidth', 0);
+      var bh:Float = floatAttr(sb, 'frameHeight', 0);
+      if (bw <= 0) bw = floatAttr(sb, 'width', 0);
+      if (bh <= 0) bh = floatAttr(sb, 'height', 0);
+      if (bw > 0 && bh > 0) return {w: bw, h: bh};
+    }
+    return null;
+  }
+
+  // Prefer the IDLE sub-texture's frame size for stage anchor conversion
+  // (the character rests on the idle animation). Returns null if no idle
+  // sub-texture exists.
+  public function idleFrameDims(subs:Array<String>):Null<Dynamic>
+  {
+    for (sb in subs)
+    {
+      var nm:String = attr(sb, 'name');
+      if (nm != null && nm.toLowerCase().indexOf('idle') >= 0)
+      {
+        var bw:Float = floatAttr(sb, 'frameWidth', 0);
+        var bh:Float = floatAttr(sb, 'frameHeight', 0);
+        if (bw <= 0) bw = floatAttr(sb, 'width', 0);
+        if (bh <= 0) bh = floatAttr(sb, 'height', 0);
+        if (bw > 0 && bh > 0) return {w: bw, h: bh};
+      }
+    }
+    return null;
+  }
+
+  // ------------------------------------------------------------------
+  // Stages (XML -> JSON)
+  // ------------------------------------------------------------------
+
+  public function convertStages(dir:String, out:Dynamic):Void
+  {
+    var stagesRoot:String = 'mods/$dir/data/stages';
+    if (!util.pathExists(stagesRoot)) return;
+    var stageFiles:Array<String> = util.listDir(stagesRoot);
+    for (stageFile in stageFiles)
+    {
+      var stageFileLower:String = stageFile.toLowerCase();
+      if (StringTools.endsWith(stageFileLower, '.hx'))
+      {
+        util.warn('Codename: stage script $stageFile is not portable to V-Slice (HScript) - only the XML stage data will be imported');
+        continue;
+      }
+      if (!StringTools.endsWith(stageFileLower, '.xml')) continue;
+      var stageId:String = stageFile.substring(0, stageFile.length - 4);
+      // Canonical lowercase id - must exactly match what songs request (see
+      // convertSongs) since StageRegistry.fetchEntry is a raw map lookup.
+      stageId = stageId.toLowerCase();
+      // Cross-mod collision: a stage also defined by an earlier imported mod
+      // gets a namespaced id here AND in convertSongs (same helper, so both
+      // sides agree). Keeps the registry entry and every stage-art cache key
+      // unique per mod.
+      var stageFileBase:String = stageId;
+      stageId = resolveStageId(dir, stageId);
+      // Only convert stages that imported songs actually reference - the art
+      // for unused stages was decoded at boot anyway (some mods ship several
+      // unused full-size stages, costing gigabytes of RAM).
+      if (get(usedStageIds, stageId) != true)
+      {
+        util.warn('Codename: skipping stage $stageFile (not referenced by any imported song)');
+        continue;
+      }
+      var xmlText:String = util.readText('$stagesRoot/$stageFile');
+      if (xmlText == null) continue;
+
+      var root:String = extractFirstTag(xmlText, 'stage');
+      var folderAttr:String = attr(root, 'folder');
+      if (folderAttr == null) folderAttr = '';
+
+      var props:Array<Dynamic> = [];
+      var characters:Dynamic = {};
+      // (name, bottom, scroll) of already-built props - used to rebase a
+      // misaligned prop's vertical parallax to the ground element below it.
+      var builtPropBottoms:Array<Dynamic> = [];
+
+      // zIndex mirrors the Codename XML layering: sprites and character
+      // anchors keep their document order (lower zIndex renders behind, just
+      // like the XML sequence). Codename's default stage zoom is applied to
+      // the stage entry below.
+      var charTagToSlot:Dynamic = {girlfriend: 'gf', boyfriend: 'bf', dad: 'dad'};
+      var charBodies:Dynamic = {};
+      var charZ:Dynamic = {};
+
+      var zOrder:Int = 0;
+      var ordered:Array<Dynamic> = orderedTags(xmlText, ['sprite', 'girlfriend', 'boyfriend', 'dad', 'character', 'char']);
+      for (entry in ordered)
+      {
+        zOrder += 10;
+        var tagName:String = Std.string(get(entry, 'name'));
+        var body:String = Std.string(get(entry, 'body'));
+        if (tagName != 'sprite')
+        {
+          // Character anchor tags - resolve to a bf/dad/gf slot.
+          var slot:Dynamic = get(charTagToSlot, tagName);
+          if (slot != null)
+          {
+            set(charBodies, Std.string(slot), body);
+            set(charZ, Std.string(slot), zOrder);
+          }
+          continue;
+        }
+
+        var name:String = attr(body, 'name');
+        if (name == null || name == '') name = 'prop$zOrder';
+        var sprite:String = attr(body, 'sprite');
+        if (sprite == null || sprite == '') sprite = name;
+        if (StringTools.endsWith(sprite.toLowerCase(), '.png')) sprite = sprite.substring(0, sprite.length - 4);
+
+        // The stage folder prefixes the sprite lookup. Some mods write the
+        // folder WITHOUT a trailing slash (gumballs: folder="stages/philly") -
+        // join with a '/' so the asset becomes stages/philly/sky instead of
+        // the malformed stages/phillysky (which silently fails to load, so
+        // the whole background vanishes).
+        var assetPath:String = sprite;
+        if (folderAttr != '')
+        {
+          assetPath = folderAttr;
+          if (!StringTools.endsWith(assetPath, '/')) assetPath += '/';
+          assetPath += sprite;
+          // Normalize slashes (covers folder plus sprite both ending/starting
+          // with a slash).
+          while (assetPath.indexOf('//') >= 0)
+          {
+            assetPath = StringTools.replace(assetPath, '//', '/');
+          }
+        }
+        // Remove trailing slash on folder.
+        if (StringTools.endsWith(assetPath, '/')) assetPath = assetPath.substring(0, assetPath.length - 1);
+        // The on-disk file keeps its original location; only the registered
+        // key may change when the stage id was namespaced.
+        var diskRel:String = assetPath;
+        // When the stage id was namespaced, re-key every asset under the
+        // stage folder ('stages/<base>/...' -> 'stages/<renamed>/...') so the
+        // art cannot be overwritten by another mod's identically-named stage.
+        if (stageId != stageFileBase && StringTools.startsWith(assetPath, 'stages/$stageFileBase'))
+        {
+          var segEnd:Int = 'stages/$stageFileBase'.length;
+          if (assetPath.length == segEnd || assetPath.charAt(segEnd) == '/')
+          {
+            assetPath = 'stages/$stageId' + assetPath.substring(segEnd);
+          }
+        }
+
+        var scrollF:Float = floatAttr(body, 'scroll', 1);
+        // Codename supports separate scrollx/scrolly (e.g. high parallax
+        // foregrounds); fall back to the single scroll attr.
+        var scrollX:Float = floatAttr(body, 'scrollx', scrollF);
+        var scrollY:Float = floatAttr(body, 'scrolly', scrollF);
+        var scaleX:Float = floatAttr(body, 'scalex', floatAttr(body, 'scale', 1));
+        var scaleY:Float = floatAttr(body, 'scaley', floatAttr(body, 'scale', 1));
+
+        // Stage sprite animations. Codename: <sprite type="beat|loop"> with
+        // <anim name=.. anim=.. fps=.. loop=.. x=.. y=../> children. V-Slice
+        // plays these through Bopper props (danceEvery + startingAnimation +
+        // prefix-based animations).
+        var propPngPath:String = 'mods/$dir/images/$diskRel.png';
+        var propAtlas:String = util.readText('mods/$dir/images/$diskRel.xml');
+        var frameNames:Array<String> = [];
+        var subTextures:Array<String> = [];
+        // Per-frame trim metadata: (name, frameX, frameY, crop width, crop height).
+        // The trim (frameX/frameY + crop size) determines where a frame's CONTENT
+        // sits inside its source box; frames whose trim differs vertically from
+        // their neighbors render their content on a different baseline.
+        var frameTrims:Array<Dynamic> = [];
+        if (propAtlas != null)
+        {
+          subTextures = extractTags(propAtlas, 'SubTexture');
+          for (st in subTextures)
+          {
+            var fn:String = attr(st, 'name');
+            if (fn != null && fn != '')
+            {
+              frameNames.push(fn);
+              frameTrims.push({
+                name: fn,
+                tx: parseIntAttr(st, 'x', 0),
+                ty: parseIntAttr(st, 'y', 0),
+                fx: parseIntAttr(st, 'frameX', 0),
+                fy: parseIntAttr(st, 'frameY', 0),
+                cw: parseIntAttr(st, 'width', 0),
+                ch: parseIntAttr(st, 'height', 0),
+                fw: parseIntAttr(st, 'frameWidth', 0),
+                fh: parseIntAttr(st, 'frameHeight', 0)
+              });
+            }
+          }
+        }
+        // Child <anim> elements live INSIDE the sprite element (after the
+        // tag's '>'), not in its attribute body - parse them from the
+        // element's content region (tank.xml-style explosions etc.).
+        var animBodies:Array<String> = [];
+        var childStart:Int = Std.int(get(entry, 'openEnd'));
+        var childEnd:Int = Std.int(get(entry, 'closePos'));
+        if (childEnd - childStart > 0)
+        {
+          animBodies = extractTags(xmlText.substring(childStart, childEnd), 'anim');
+        }
+        var animsOut:Array<Dynamic> = [];
+        for (ab in animBodies)
+        {
+          animsOut.push({
+            name: attr(ab, 'name'),
+            prefix: attr(ab, 'anim'),
+            frameRate: parseIntAttr(ab, 'fps', 24),
+            looped: boolAttr(ab, 'loop', false),
+            offsets: [parseIntAttr(ab, 'x', 0), parseIntAttr(ab, 'y', 0)]
+          });
+        }
+        // Codename stage sprites default to LOOP (Stage.hx creates them with
+        // defaultAnimType LOOP), and a sprite with an atlas but no <anim>
+        // children gets an implicit 'idle' over ALL its frames (XMLUtil
+        // loadSpriteFromXML). Reproduce both so beat/loop props animate
+        // instead of rendering as a static full-sheet texture.
+        var spriteType:String = attr(body, 'type');
+        if (spriteType == null || spriteType == '') spriteType = 'loop';
+        var realignedPropAtlas:String = null;
+        if (animsOut.length == 0 && frameNames.length > 0 && spriteType != 'none')
+        {
+          // Detect pose groups whose trim baseline hops vertically. An atlas
+          // whose frames repeat identical drawings (same trim) in runs plays a
+          // staccato loop; when two such runs render their content on
+          // DIFFERENT baselines (frameY or crop height differ), the loop makes
+          // the prop visibly float/jump (gumballs' highschool crowd: pose A
+          // offset 10px high + 222-tall crop vs pose B 0px + 232-tall crop).
+          // Instead of dropping the animation, RE-ALIGN every pose's draw
+          // offset so the content centers coincide - the loop then plays in
+          // place as a subtle pulse instead of drifting diagonally.
+          var trimGroups:Array<Dynamic> = [];
+          var curGroup:Dynamic = null;
+          for (ft in frameTrims)
+          {
+            if (curGroup == null
+              || curGroup.fx != ft.fx
+              || curGroup.fy != ft.fy
+              || curGroup.cw != ft.cw
+              || curGroup.ch != ft.ch)
+            {
+              curGroup = {
+                fx: ft.fx,
+                fy: ft.fy,
+                cw: ft.cw,
+                ch: ft.ch,
+                frames: 0,
+                firstName: ft.name
+              };
+              trimGroups.push(curGroup);
+            }
+            curGroup.frames = curGroup.frames + 1;
+          }
+          var minFy:Int = 9999;
+          var maxFy:Int = -9999;
+          var minCh:Int = 9999;
+          var maxCh:Int = -9999;
+          var multiFrame:Array<Dynamic> = [];
+          for (g in trimGroups)
+          {
+            if (g.frames > 1) multiFrame.push(g);
+            if (g.fy < minFy) minFy = g.fy;
+            if (g.fy > maxFy) maxFy = g.fy;
+            if (g.ch < minCh) minCh = g.ch;
+            if (g.ch > maxCh) maxCh = g.ch;
+          }
+          // Multiple repeated poses with a >=8px vertical trim spread.
+          var misaligned:Bool = multiFrame.length > 1 && (maxFy - minFy) >= 8;
+          if (misaligned)
+          {
+            // Reference pose = the one closest to an untrimmed box (largest
+            // frameY = the standing/grounded pose). The author draws every
+            // pose's feet at the sourceSize box BOTTOM (content bottom =
+            // offset.y + crop height = frameHeight for all poses - verified:
+            // pose A -frameY 10 + crop 222 = 232 = -frameY 0 + 232 of pose B),
+            // so the feet NEVER lift. What drifts between poses is the
+            // HORIZONTAL placement (pose A is shifted ~36px right of B). Pin
+            // every pose's horizontal center to the reference and leave the
+            // vertical trims AS AUTHORED - the crowd then bounces in place
+            // with planted feet instead of drifting side to side.
+            var ref:Dynamic = trimGroups[0];
+            for (g in trimGroups)
+            {
+              if (g.fy > ref.fy || (g.fy == ref.fy && g.ch > ref.ch)) ref = g;
+            }
+            var refCx:Float = (-ref.fx) + ref.cw / 2;
+            // flixel draws the crop at sprite pos + offset, and offset =
+            // (-frameX, -frameY) - so content center x = -frameX + cw/2.
+            // Pin every frame's horizontal center to the reference's.
+            var realignedText:String = propAtlas;
+            for (st in subTextures)
+            {
+              var stName:String = attr(st, 'name');
+              if (stName == null || stName == '') continue;
+              var stTrim:Dynamic = null;
+              for (ft in frameTrims)
+              {
+                if (ft.name == stName)
+                {
+                  stTrim = ft;
+                  break;
+                }
+              }
+              if (stTrim == null) continue;
+              var newFx:Int = Std.int(-Math.round(refCx - stTrim.cw / 2));
+              var oldFx:Int = stTrim.fx;
+              if (newFx == oldFx) continue;
+              var newBody:String = StringTools.replace(st, 'frameX="$oldFx"', 'frameX="$newFx"');
+              realignedText = StringTools.replace(realignedText, st, newBody);
+            }
+            if (realignedText != propAtlas)
+            {
+              realignedPropAtlas = realignedText;
+              util.warn('Codename: stage prop "$name" has poses offset horizontally (${maxFy - minFy}px trim spread) - centered their frames so the animation stays put (feet already share the ground line)');
+            }
+          }
+
+          // Longest prefix shared by every frame name; addByPrefix picks up
+          // all frames starting with it, i.e. the whole sheet in order.
+          var commonPrefix:String = frameNames[0];
+          for (fi in 1...frameNames.length)
+          {
+            while (commonPrefix.length > 0 && !StringTools.startsWith(frameNames[fi], commonPrefix))
+            {
+              commonPrefix = commonPrefix.substring(0, commonPrefix.length - 1);
+            }
+            if (commonPrefix == '') break;
+          }
+          if (commonPrefix != '')
+          {
+            // Play the implicit idle at 12fps, matching how the fork's own
+            // vanilla animated props are authored (mainStageErect crowd uses
+            // frameRate 12). The source engine hardcodes 24fps here, but at
+            // 24fps a two-pose ambient bounce reads as 'floating'; 12fps
+            // keeps the same frames at a calmer rate.
+            animsOut.push({
+              name: 'idle',
+              prefix: commonPrefix,
+              frameRate: 12,
+              looped: spriteType != 'beat',
+              offsets: [0, 0]
+            });
+          }
+          else
+          {
+            util.warn('Codename: stage prop "$name" atlas frames share no common prefix - imported as a static image');
+          }
+        }
+
+        // Both engines use the official flixel fork, whose draw math is
+        //   drawnTL = x - offset + origin*(1-scale)
+        // with updateHitbox() setting offset = frame*(1-S)/2 and centering
+        // the origin - so AFTER updateHitbox the offset and origin terms
+        // cancel and the top-left is drawn EXACTLY at x/y (vanilla mainStage
+        // keeps legacy coords like stagefront [-650,600] at scale 1.1 as-is).
+        // Codename stage sprites never run updateHitbox (unless the XML asks)
+        // so they keep offset (0,0) with a CENTERED origin and draw the
+        // top-left at x + frameW*(1-scaleX)/2. Reproduce that exactly:
+        //   position = [x + frameW*(1-scaleX)/2, y + frameH*(1-scaleY)/2]
+        var propPngPath:String = 'mods/$dir/images/$diskRel.png';
+        var propDims:Dynamic = util.spriteDims(propAtlas, propPngPath);
+        var px:Float = floatAttr(body, 'x', 0);
+        var py:Float = floatAttr(body, 'y', 0);
+        if (propDims != null)
+        {
+          px += util.getFloat(propDims.w, 0) * (1 - scaleX) / 2;
+          py += util.getFloat(propDims.h, 0) * (1 - scaleY) / 2;
+        }
+
+        var prop:Dynamic = {
+          name: name,
+          animType: 'sparrow',
+          assetPath: assetPath,
+          position: [px, py],
+          scale: [scaleX, scaleY],
+          scroll: [scrollX, scrollY],
+          flipX: boolAttr(body, 'flipX', false),
+          alpha: floatAttr(body, 'alpha', 1),
+          angle: floatAttr(body, 'angle', 0),
+          zIndex: zOrder,
+          animations: animsOut
+        };
+        // Codename: BEAT props bop on the beat, LOOP props play
+        // continuously. Mirror that: only beat props get danceEvery; loop
+        // props start their animation and keep running (danceEvery 0).
+        if (animsOut.length > 0)
+        {
+          prop.startingAnimation = Std.string(get(animsOut[0], 'name'));
+          if (spriteType == 'beat')
+          {
+            prop.danceEvery = parseIntAttr(body, 'beatInterval', 1);
+            if (prop.danceEvery < 1) prop.danceEvery = 1;
+          }
+        }
+        // Optional visual attributes.
+        if (boolAttr(body, 'antialiasing', true) == false) prop.isPixel = true;
+        var blendRaw:String = attr(body, 'blend');
+        if (blendRaw != null && blendRaw != '') prop.blend = blendRaw;
+        var colorRaw:String = attr(body, 'color');
+        if (colorRaw != null && colorRaw != '') prop.color = colorRaw;
+
+        // Create()-time overrides from the song scripts (sprites hidden until
+        // an HScript Call event reveals them) - render them invisible now.
+        var spritePatch:Dynamic = get(stageSpritePatch, stageId);
+        if (spritePatch != null)
+        {
+          var pa:Dynamic = get(spritePatch, name);
+          if (pa == null) pa = get(spritePatch, sprite);
+          if (pa != null) prop.alpha = pa;
+        }
+        // Misaligned-pose props (realigned above) are crowd/building-adjacent
+        // props whose feet already touch their own ground line; the residual
+        // 'floating' comes from their feet sitting ABOVE the ground plane the
+        // stage paints in front of them at the song's camera. Plant them ON
+        // the ground plane: reuse the lowest/front-most element below them
+        // (the stage floor) - match ITS parallax and drop the prop's feet to
+        // that plane's top edge (the deep ground line where the background
+        // meets the floor). The prop then stays glued to the ground at ANY
+        // camera height.
+        //
+        // This is the one deliberate deviation from a strict 1:1 port of
+        // Codename's loader (which keeps the author's scroll + y and lets the
+        // crowd hover the way it does in the original engine). Set
+        // stageBias.<id>.crowdGround=false in the layer config to get the
+        // untouched, author-placed version instead.
+        var crowdGround:Bool = true;
+        var cfgGround:Dynamic = getLayerConfig();
+        var stageGroundBias:Dynamic = get(cfgGround, 'stageBias');
+        if (stageGroundBias != null)
+        {
+          var sgGround:Dynamic = get(stageGroundBias, stageId);
+          if (sgGround != null && get(sgGround, 'crowdGround') != null)
+          {
+            crowdGround = util.getFloat(get(sgGround, 'crowdGround'), 1) > 0;
+          }
+        }
+        if (crowdGround && realignedPropAtlas != null && propDims != null)
+        {
+          // Plant the prop's VISIBLE feet (not its frame box) onto the ground
+          // element's VISIBLE surface (not its frame top). Modded crowd art
+          // usually has empty padding below the drawn characters (gumballs'
+          // highschool crowd: feet ~17px above the frame bottom) and ground
+          // art a transparent margin above the drawn surface (floor: ~19px),
+          // so planting the bare frames leaves a visible hover gap. Both
+          // offsets are measured from the actual PNGs (best-effort; 0 keeps
+          // the old frame-based behavior on any read/decode failure).
+          var myFeet:Float = py + util.getFloat(propDims.h, 0) * scaleY;
+          var ground:Dynamic = null;
+          for (b in builtPropBottoms)
+          {
+            if (util.getFloat(get(b, 'bottom'), 0) > myFeet + 4)
+            {
+              if (ground == null || util.getFloat(get(b, 'bottom'), 0) > util.getFloat(get(ground, 'bottom'), 0)) ground = b;
+            }
+          }
+          if (ground != null && get(ground, 'topY') != null)
+          {
+            var feetInset:Float = 0;
+            if (frameTrims != null && frameTrims.length > 0)
+            {
+              feetInset = util.propFeetInset('mods/$dir/images/$diskRel.png', frameTrims);
+            }
+            var groundScaleY:Float = util.getFloat(get(ground, 'scaleY'), 1);
+            var groundInset:Float = util.groundSurfaceInset(Std.string(get(ground, 'pngRel')), get(ground, 'frameRect'));
+            var visualFeet:Float = myFeet - feetInset * scaleY;
+            var groundTop:Float = util.getFloat(get(ground, 'topY'), 0);
+            var groundSurface:Float = groundTop + groundInset * groundScaleY;
+            var dy:Float = groundSurface - visualFeet;
+            var groundScroll:Float = util.getFloat(get(ground, 'scroll'), 1);
+            prop.position = [px, py + dy];
+            prop.scroll = [groundScroll, groundScroll];
+            util.warn('Codename: stage prop "$name" planted on the ground plane (element "' + Std.string(get(ground, 'name')) + '") - drawn feet moved $dy (art feet inset $feetInset, ground surface inset $groundInset) so the drawn feet touch the drawn ground at any camera');
+          }
+        }
+        props.push(prop);
+        if (propDims != null)
+        {
+          var groundRect:Dynamic = {x: 0, y: 0, w: util.getFloat(propDims.w, 0), h: util.getFloat(propDims.h, 0), fy: 0};
+          if (frameTrims != null && frameTrims.length > 0 && get(frameTrims[0], 'fw') != null && util.getFloat(get(frameTrims[0], 'fw'), 0) > 0)
+          {
+            groundRect = {x: get(frameTrims[0], 'tx'), y: get(frameTrims[0], 'ty'), w: get(frameTrims[0], 'cw'), h: get(frameTrims[0], 'ch'), fy: get(frameTrims[0], 'fy')};
+          }
+          builtPropBottoms.push({name: name, bottom: py + util.getFloat(propDims.h, 0) * scaleY, scroll: util.getFloat(get(prop, 'scroll')[1], scrollY), topY: py, scaleY: scaleY, pngRel: 'mods/$dir/images/$diskRel.png', frameRect: groundRect});
+        }
+
+        addImage(out, dir, '$diskRel.png', '$assetPath.png');
+        // The realigned atlas overrides the on-disk one for the fork (the
+        // prop's animations play the aligned frames; without this the raw
+        // file would re-register over it via addImage above).
+        if (realignedPropAtlas != null)
+        {
+          out.texts.push({paths: util.imageKeys('$assetPath.xml'), content: realignedPropAtlas});
+        }
+      }
+
+      // Character anchor tags. Codename anchors are the sprite's TOP-LEFT
+      // corner (psych heritage: defaults are (770,100)/(100,100)), while
+      // V-Slice positions characters by feet/center - so the anchor is
+      // shifted by half width / full height of the slot's character, plus
+      // the character's baked root offset (see placeAnchor).
+      var bfZ:Int = 300; if (get(charZ, 'bf') != null) bfZ = Std.int(get(charZ, 'bf'));
+      var dadZ:Int = 200; if (get(charZ, 'dad') != null) dadZ = Std.int(get(charZ, 'dad'));
+      var gfZ:Int = 100; if (get(charZ, 'gf') != null) gfZ = Std.int(get(charZ, 'gf'));
+      placeAnchor(stageId, get(charBodies, 'bf'), characters, 'bf', bfZ, 770, 100, 1);
+      placeAnchor(stageId, get(charBodies, 'dad'), characters, 'dad', dadZ, 100, 100, 1);
+      placeAnchor(stageId, get(charBodies, 'gf'), characters, 'gf', gfZ, 400, 130, 0.95);
+
+      // Apply create()-time character visibility from the song script
+      // ('dad.visible = false', 'gf.visible = false'...). The reveal events
+      // those scripts would fire are HScript and don't run here, so the
+      // initial hidden state is what sticks - which matches the create()
+      // intent better than showing characters the mod never meant to show.
+      var charPatch:Dynamic = get(stageSpritePatch, stageId);
+      if (charPatch != null)
+      {
+        var refToSlot:Dynamic = {boyfriend: 'bf', player: 'bf', dad: 'dad', opponent: 'dad', gf: 'gf', girlfriend: 'gf'};
+        for (refName in ReflectUtil.fields(refToSlot))
+        {
+          var patchAlpha:Dynamic = get(charPatch, refName);
+          if (patchAlpha == null) continue;
+          var slotName:String = Std.string(get(refToSlot, refName));
+          var charEntry:Dynamic = get(characters, slotName);
+          if (charEntry != null)
+          {
+            var curAlpha:Float = util.getFloat(get(charEntry, 'alpha'), 1);
+            var newAlpha:Float = util.getFloat(patchAlpha, 0);
+            if (newAlpha < curAlpha)
+            {
+              set(charEntry, 'alpha', newAlpha);
+            }
+          }
+        }
+      }
+
+      // Codename's default camera zoom when the stage has no zoom attr.
+      var cameraZoom:Float = floatAttr(root, 'zoom', 0.9);
+      if (cameraZoom <= 0) cameraZoom = 0.9;
+      // create()-time zoom override from the stage script (top-level
+      // assignments only - mid-song beatHit changes are time-dependent and
+      // not portable).
+      var scriptZoom:Float = stageScriptZoom(dir, stageId);
+      if (scriptZoom > 0)
+      {
+        util.warn('Codename: stage "$stageId" script sets a custom camera zoom $scriptZoom');
+        cameraZoom = scriptZoom;
+      }
+      // Per-stage zoom override from the layer config (stageBias.<id>.zoom) -
+      // the Uboa-style charts drop very low (0.5x) and some stages need a
+      // nudge (+/-) to match the original look.
+      var cfg2:Dynamic = getLayerConfig();
+      var stageOver2:Dynamic = get(cfg2, 'stageBias');
+      if (stageOver2 != null)
+      {
+        var over2:Dynamic = get(stageOver2, stageId);
+        if (over2 != null && get(over2, 'zoom') != null) cameraZoom = util.getFloat(get(over2, 'zoom'), cameraZoom);
+      }
+
+      var stageData:Dynamic = {
+        version: '1.0.0',
+        name: stageId,
+        cameraZoom: cameraZoom,
+        characters: characters,
+        props: props
+      };
+      addText(out, util.dataTextKeys('stages/$stageId.json'), util.stringify(stageData));
+      out.stages.push(stageId);
+      util.claimForeign('stages', stageId);
+
+      // Generate ScriptedStage .hxc with raw Codename anchor data baked in.
+      var stageScript:String = generateStageScript(stageId, stageId, xmlText);
+      if (stageScript != null && stageScript.length > 0)
+      {
+        if (out.stageScripts == null) out.stageScripts = [];
+        out.stageScripts.push({id: stageId, content: stageScript});
+      }
+    }
+  }
+
+  // The stage HScript with the same base name as the stage XML (codename
+  // convention: stage.xml + stage.hx), case-insensitive. Returns null when
+  // the mod ships no script.
+  public function stageScriptText(dir:String, stageId:String):String
+  {
+    var files:Array<String> = util.listDir('mods/$dir/data/stages');
+    for (f in files)
+    {
+      var fl:String = f.toLowerCase();
+      if (!StringTools.endsWith(fl, '.hx')) continue;
+      if (f.substring(0, f.length - 3).toLowerCase() == stageId) return util.readText('mods/$dir/data/stages/$f');
+    }
+    return null;
+  }
+
+  // Parse create()-time '<ref>.cameraOffset = FlxPoint.get(x, y)' overrides
+  // from a stage script. RETIRED: Codename only runs these in create() when
+  // the character references exist, which the ordering analysis could not
+  // confirm - applying them threw the camera off. Kept out of the conversion;
+  // user-reported over-tuning is handled via stageBias config instead.
+
+  // create()-time 'defaultCamZoom = <n>' from the stage script's TOP-LEVEL
+  // chunk (before the first function - mid-song beatHit changes are not
+  // portable). Returns -1 when unset.
+  public function stageScriptZoom(dir:String, stageId:String):Float
+  {
+    var scriptText:String = stageScriptText(dir, stageId);
+    if (scriptText == null || scriptText == '') return -1;
+    var fnIdx:Int = scriptText.indexOf('function');
+    var topText:String = fnIdx >= 0 ? scriptText.substring(0, fnIdx) : scriptText;
+    var needle:String = 'defaultCamZoom';
+    var result:Float = -1;
+    var pos:Int = 0;
+    while (true)
+    {
+      var idx:Int = topText.indexOf(needle, pos);
+      if (idx < 0) break;
+      var eq:Int = topText.indexOf('=', idx);
+      if (eq >= 0)
+      {
+        var end:Int = topText.indexOf('\n', eq);
+        if (end < 0) end = topText.length;
+        var seg:String = StringTools.trim(topText.substring(eq + 1, end));
+        var semi:Int = seg.indexOf(';');
+        if (semi > 0) seg = StringTools.trim(seg.substring(0, semi));
+        var v:Float = Std.parseFloat(seg);
+        if (v != null && !Math.isNaN(v) && v > 0) result = v;
+      }
+      pos = idx + needle.length;
+    }
+    return result;
+  }
+
+  // Convert a codename character anchor (top-left based) into a V-Slice
+  // stage character entry (feet/center based). The anchor's scale multiplies
+  // the character's base scale in both engines, so the drawn size is
+  // frameSize * charDataScale * anchorScale.
+  //
+  // Both engines render with the same flixel fork: drawnTL = x - offset +
+  // origin*(1-scale), and updateHitbox() makes offset cancel origin, so a
+  // V-Slice stage position anchors the drawn frame's CENTER-x and FEET-y
+  // (scale-independent). Codename characters apply their global offset as a
+  // flixel offset (offset.x = rootX * (isPlayer != playerOffsets ? 1 : -1))
+  // and scale about the CENTERED origin, so their drawn center is
+  // (x + rootX*flipFactor + frameW/2, ...) and their feet are (..., y + rootY
+  // + frameH*(1+S)/2). Aligning the two:
+  //   position.x = x + rootX*f + frameW/2      (drawn center x)
+  //   position.y = y + rootY + frameH*(1+S)/2  (drawn feet)
+  public function placeAnchor(stageId:String, body:String, characters:Dynamic, key:String, zIndex:Int, defX:Float, defY:Float, defScroll:Float):Void
+  {
+    if (body == null) body = '';
+    var x:Float = defX;
+    var y:Float = defY;
+    var anchorScale:Float = 1;
+    var scroll:Float = defScroll;
+    var alpha:Float = 1;
+    var angle:Float = 0;
+    var camX:Float = 0;
+    var camY:Float = 0;
+    if (body != '')
+    {
+      x = floatAttr(body, 'x', defX);
+      y = floatAttr(body, 'y', defY);
+      var sxRaw:String = attr(body, 'scalex');
+      if (sxRaw != null && sxRaw != '')
+      {
+        anchorScale = Std.parseFloat(sxRaw);
+        if (anchorScale == null) anchorScale = 1;
+      }
+      else
+      {
+        anchorScale = floatAttr(body, 'scale', 1);
+      }
+      scroll = floatAttr(body, 'scroll', defScroll);
+      alpha = floatAttr(body, 'alpha', 1);
+      angle = floatAttr(body, 'angle', 0);
+      // Some mods write camx/camy on the anchor instead of camxoffset/camyoffset.
+      camX = floatAttr(body, 'camxoffset', floatAttr(body, 'camx', 0));
+      camY = floatAttr(body, 'camyoffset', floatAttr(body, 'camy', 0));
+    }
+
+    // Determine the slot character's frame size (imported chars were
+    // registered in charMetrics; native chars fall back to the game's
+    // animate atlas).
+    var hint:String = '';
+    var hints:Dynamic = get(stageCharHints, stageId);
+    if (hints != null) hint = Std.string(get(hints, key));
+    if (hint == null) hint = '';
+
+    var m:Dynamic = hint != '' ? get(charMetrics, hint) : null;
+    if (m == null && hint != '')
+    {
+      m = nativeCharMetrics(hint);
+      if (m != null) set(charMetrics, hint, m);
+    }
+    // Codename anchors are the sprite's TOP-LEFT corner. Both engines draw
+    // with the same fork math (drawnTL = x - offset + origin*(1-scale));
+    // V-Slice's updateHitbox() compensates offset against origin so a stage
+    // character's drawn frame CENTER-x and FEET-y sit exactly at its stage
+    // position, independent of scale. Codename characters carry their global
+    // offset as a flixel offset (offset.x = rootX * (isPlayer != playerOffsets
+    // ? 1 : -1), offset.y = -rootY) and scale about the CENTERED origin, so
+    // their drawn center is (x + rootX*flipFactor + frameW/2, ...) and their
+    // feet are (..., y + rootY + frameH*(1+S)/2). Align the two:
+    //   position = [x + rootX*f + frameW/2, y + rootY + frameH*(1+S)/2]
+    var fw:Float = 640;
+    var fh:Float = 640;
+    var baseScale:Float = 1;
+    var rootX:Float = 0;
+    var rootY:Float = 0;
+    var xmlIsPlayer:Bool = false;
+    if (m != null)
+    {
+      fw = util.getFloat(get(m, 'w'), 640);
+      fh = util.getFloat(get(m, 'h'), 640);
+      baseScale = util.getFloat(get(m, 's'), 1);
+      rootX = util.getFloat(get(m, 'ox'), 0);
+      rootY = util.getFloat(get(m, 'oy'), 0);
+      xmlIsPlayer = util.getBool(get(m, 'op'), false);
+    }
+    var finalScale:Float = baseScale * anchorScale;
+    // Codename's flixel offset sign: playAnim sets
+    //   offset.x = globalOffset.x * (isPlayer != playerOffsets ? 1 : -1)
+    // and the fork draws the frame box centered at x - offset.x + frameW/2.
+    // With slotIsPlayer == xmlIsPlayer the offset factor is -1, so the box
+    // center is x + rootX + frameW/2 (the global offset is a flixel offset:
+    // positive pushes the ART left of the anchor); when the runtime role
+    // differs from the XML role the factor is +1 and the center is
+    // x - rootX + frameW/2. That is exactly x + rootX * flipFactor + frameW/2.
+    var slotIsPlayer:Bool = (key == 'bf');
+    var flipFactor:Float = (slotIsPlayer == xmlIsPlayer) ? 1 : -1;
+
+    // Optional tuning from the layer config. The conversion reproduces the
+    // source engine's rendering exactly, so the default biases are 0; the
+    // per-stage overrides (stageBias.<id>.x/.y) exist for mods whose art
+    // renders slightly differently in V-Slice.
+    var cfg:Dynamic = getLayerConfig();
+    var camBiasX:Float = util.getFloat(get(cfg, 'cameraBiasX'), 0);
+    var camBiasY:Float = util.getFloat(get(cfg, 'cameraBiasY'), 0);
+    var charBiasX:Float = util.getFloat(get(cfg, 'characterBiasX'), 0);
+    var charBiasY:Float = util.getFloat(get(cfg, 'characterBiasY'), 0);
+    var stageOver:Dynamic = get(cfg, 'stageBias');
+    if (stageOver != null)
+    {
+      var over:Dynamic = get(stageOver, stageId);
+      if (over != null)
+      {
+        if (get(over, 'x') != null) charBiasX = util.getFloat(get(over, 'x'), charBiasX);
+        if (get(over, 'y') != null) charBiasY = util.getFloat(get(over, 'y'), charBiasY);
+        if (get(over, 'camx') != null) camBiasX = util.getFloat(get(over, 'camx'), camBiasX);
+        if (get(over, 'camy') != null) camBiasY = util.getFloat(get(over, 'camy'), camBiasY);
+      }
+    }
+    // Slot-specific character bias (stageBias.<id>.bfY/.dadY/.gfY), for
+    // flattening a single character (e.g. a girlfriend whose trimmed sprite
+    // art sits above its frame box - GUNLICK's gf floats ~55px over the
+    // stage floor). Applied on top of the generic x/y bias.
+    if (stageOver != null)
+    {
+      var over2:Dynamic = get(stageOver, stageId);
+      if (over2 != null)
+      {
+        var slotBiasY:Float = 0;
+        if (key == 'bf') slotBiasY = util.getFloat(get(over2, 'bfY'), 0);
+        if (key == 'dad') slotBiasY = util.getFloat(get(over2, 'dadY'), 0);
+        if (key == 'gf') slotBiasY = util.getFloat(get(over2, 'gfY'), 0);
+        charBiasY += slotBiasY;
+      }
+    }
+
+    // Camera focus: V-Slice focuses at (position + width/2) + cameraOffsets;
+    // its width is the DRAWN idle frame x final scale, so the focus base is
+    // (P.x, P.y - idleH*finalScale/2). Codename focuses its HITBOX midpoint,
+    // which stays on the FIRST sub-texture scaled by the character's own
+    // scale (the stage anchor scale only affects the drawn sprite, not the
+    // hitbox): midpoint = (x + firstW*baseScale/2, y + firstH*baseScale/2),
+    // plus the role fudge, the root global offset and camxoffset. The
+    // cameraOffsets are the difference between the two midpoints:
+    //   offX = camX + rootX*(1-flipFactor) + fudge + (firstW*baseScale - idleW)/2
+    //   offY = camY - 100 + (firstH*baseScale - idleH)/2
+    // (for first-frame == idle-frame chars this reduces to the old
+    // frame*(baseScale-1)/2 term, so existing mods are unchanged).
+    var camFudgeX:Float = slotIsPlayer ? -100 : 150;
+    var firstW:Float = fw;
+    var firstH:Float = fh;
+    if (m != null)
+    {
+      firstW = util.getFloat(get(m, 'w0'), fw);
+      firstH = util.getFloat(get(m, 'h0'), fh);
+    }
+
+    set(characters, key, {
+      zIndex: zIndex,
+      position: [x + rootX * flipFactor + (fw / 2) + charBiasX, y + rootY + (fh * (1 + finalScale) / 2) + charBiasY],
+      cameraOffsets: [camX + rootX * (1 - flipFactor) + camFudgeX + (firstW * baseScale - fw) / 2 + camBiasX,
+        camY - 100 + (firstH * baseScale - fh) / 2 + camBiasY],
+      scale: anchorScale,
+      scroll: [scroll, scroll],
+      alpha: alpha,
+      angle: angle
+    });
+  }
+
+  // Frame dims for a native (non-imported) character via the game's own
+  // animate atlas manifest.
+  public function nativeCharMetrics(charId:String):Dynamic
+  {
+    try
+    {
+      var manifest:Dynamic = util.readJson('assets/shared/images/characters/$charId/spritemap1.json');
+      if (manifest != null)
+      {
+        var frames:Dynamic = get(manifest, 'frames');
+        var keys:Array<String> = Reflect.fields(frames);
+        if (keys.length > 0)
+        {
+          var first:Dynamic = get(frames, keys[0]);
+          var src:Dynamic = get(first, 'sourceSize');
+          if (src != null)
+          {
+            return {w: util.getFloat(get(src, 'w'), 640), h: util.getFloat(get(src, 'h'), 640), s: 1, ox: 0, oy: 0, op: false};
+          }
+        }
+      }
+    }
+    catch (e:Dynamic)
+    {
+      // fall through
+    }
+    return null;
+  }
+
+  // ------------------------------------------------------------------
+  // ScriptedStage generation for Codename
+  // ------------------------------------------------------------------
+
+  // Generate a ScriptedStage .hxc for a Codename stage.
+  // Bakes in raw anchor data and overrides addCharacter() to position
+  // characters using Codename's exact logic at play time.
+  public function generateStageScript(variantId:String, stageId:String, xmlText:String):String
+  {
+    // Parse character anchor positions from the XML
+    var bfBody:String = '';
+    var gfBody:String = '';
+    var dadBody:String = '';
+    var charTagToSlot:Dynamic = {girlfriend: 'gf', boyfriend: 'bf', dad: 'dad'};
+    var ordered:Array<Dynamic> = orderedTags(xmlText, ['boyfriend', 'girlfriend', 'dad']);
+    for (entry in ordered)
+    {
+      var tagName:String = Std.string(get(entry, 'name'));
+      var slot:Dynamic = get(charTagToSlot, tagName);
+      if (slot != null)
+      {
+        var body:String = Std.string(get(entry, 'body'));
+        var slotStr:String = Std.string(slot);
+        if (slotStr == 'bf') bfBody = body;
+        else if (slotStr == 'gf') gfBody = body;
+        else if (slotStr == 'dad') dadBody = body;
+      }
+    }
+
+    // Defaults (Codename defaults)
+    var bfX:Float = floatAttr(bfBody, 'x', 770);
+    var bfY:Float = floatAttr(bfBody, 'y', 100);
+    var gfX:Float = floatAttr(gfBody, 'x', 400);
+    var gfY:Float = floatAttr(gfBody, 'y', 130);
+    var dadX:Float = floatAttr(dadBody, 'x', 100);
+    var dadY:Float = floatAttr(dadBody, 'y', 100);
+    var bfScale:Float = floatAttr(bfBody, 'scale', 1);
+    var gfScale:Float = floatAttr(gfBody, 'scale', 1);
+    var dadScale:Float = floatAttr(dadBody, 'scale', 1);
+    var bfScroll:Float = floatAttr(bfBody, 'scroll', 1);
+    var gfScroll:Float = floatAttr(gfBody, 'scroll', 0.95);
+    var dadScroll:Float = floatAttr(dadBody, 'scroll', 1);
+    var bfCamX:Float = floatAttr(bfBody, 'camxoffset', floatAttr(bfBody, 'camx', 0));
+    var bfCamY:Float = floatAttr(bfBody, 'camyoffset', floatAttr(bfBody, 'camy', 0));
+    var gfCamX:Float = floatAttr(gfBody, 'camxoffset', floatAttr(gfBody, 'camx', 0));
+    var gfCamY:Float = floatAttr(gfBody, 'camyoffset', floatAttr(gfBody, 'camy', 0));
+    var dadCamX:Float = floatAttr(dadBody, 'camxoffset', floatAttr(dadBody, 'camx', 0));
+    var dadCamY:Float = floatAttr(dadBody, 'camyoffset', floatAttr(dadBody, 'camy', 0));
+
+    // Character metrics from charMetrics (rootX, rootY, frameW, frameH, baseScale, isPlayer)
+    var hints:Dynamic = get(stageCharHints, variantId);
+    var bfCharId:String = hints != null ? Std.string(get(hints, 'bf')) : '';
+    var gfCharId:String = hints != null ? Std.string(get(hints, 'gf')) : '';
+    var dadCharId:String = hints != null ? Std.string(get(hints, 'dad')) : '';
+
+    // Extract metrics for each character
+    var bfM:Dynamic = bfCharId != '' ? get(charMetrics, bfCharId) : null;
+    var gfM:Dynamic = gfCharId != '' ? get(charMetrics, gfCharId) : null;
+    var dadM:Dynamic = dadCharId != '' ? get(charMetrics, dadCharId) : null;
+
+    var safeId:String = sanitizeClassName(variantId);
+    var className:String = 'Codename_' + safeId + 'Stage';
+
+    var sb:StringBuf = new StringBuf();
+    sb.add('// Auto-generated by funky-compat for Codename stage: $variantId\n');
+    sb.add('import funkin.play.stage.Stage;\n');
+    sb.add('import funkin.play.character.BaseCharacter;\n');
+    sb.add('import funkin.play.character.CharacterType;\n');
+    sb.add('class ' + className + ' extends Stage\n');
+    sb.add('{\n');
+
+    // Raw anchor positions
+    sb.add('  var _bfX:Float = ' + bfX + ';\n');
+    sb.add('  var _bfY:Float = ' + bfY + ';\n');
+    sb.add('  var _gfX:Float = ' + gfX + ';\n');
+    sb.add('  var _gfY:Float = ' + gfY + ';\n');
+    sb.add('  var _dadX:Float = ' + dadX + ';\n');
+    sb.add('  var _dadY:Float = ' + dadY + ';\n');
+    sb.add('  var _bfScale:Float = ' + bfScale + ';\n');
+    sb.add('  var _gfScale:Float = ' + gfScale + ';\n');
+    sb.add('  var _dadScale:Float = ' + dadScale + ';\n');
+    sb.add('  var _bfScroll:Float = ' + bfScroll + ';\n');
+    sb.add('  var _gfScroll:Float = ' + gfScroll + ';\n');
+    sb.add('  var _dadScroll:Float = ' + dadScroll + ';\n');
+    sb.add('  var _bfCamX:Float = ' + bfCamX + ';\n');
+    sb.add('  var _bfCamY:Float = ' + bfCamY + ';\n');
+    sb.add('  var _gfCamX:Float = ' + gfCamX + ';\n');
+    sb.add('  var _gfCamY:Float = ' + gfCamY + ';\n');
+    sb.add('  var _dadCamX:Float = ' + dadCamX + ';\n');
+    sb.add('  var _dadCamY:Float = ' + dadCamY + ';\n');
+
+    // Character metrics (rootX, rootY, frameW, frameH, baseScale, xmlIsPlayer)
+    sb.add('  var _bfRootX:Float = ' + util.getFloat(get(bfM, 'ox'), 0) + ';\n');
+    sb.add('  var _bfRootY:Float = ' + util.getFloat(get(bfM, 'oy'), 0) + ';\n');
+    sb.add('  var _bfW:Float = ' + util.getFloat(get(bfM, 'w'), 640) + ';\n');
+    sb.add('  var _bfH:Float = ' + util.getFloat(get(bfM, 'h'), 640) + ';\n');
+    sb.add('  var _bfS:Float = ' + util.getFloat(get(bfM, 's'), 1) + ';\n');
+    sb.add('  var _bfIsPlayer:Bool = ' + util.getBool(get(bfM, 'op'), false) + ';\n');
+    sb.add('  var _gfRootX:Float = ' + util.getFloat(get(gfM, 'ox'), 0) + ';\n');
+    sb.add('  var _gfRootY:Float = ' + util.getFloat(get(gfM, 'oy'), 0) + ';\n');
+    sb.add('  var _gfW:Float = ' + util.getFloat(get(gfM, 'w'), 640) + ';\n');
+    sb.add('  var _gfH:Float = ' + util.getFloat(get(gfM, 'h'), 640) + ';\n');
+    sb.add('  var _gfS:Float = ' + util.getFloat(get(gfM, 's'), 1) + ';\n');
+    sb.add('  var _gfIsPlayer:Bool = ' + util.getBool(get(gfM, 'op'), false) + ';\n');
+    sb.add('  var _dadRootX:Float = ' + util.getFloat(get(dadM, 'ox'), 0) + ';\n');
+    sb.add('  var _dadRootY:Float = ' + util.getFloat(get(dadM, 'oy'), 0) + ';\n');
+    sb.add('  var _dadW:Float = ' + util.getFloat(get(dadM, 'w'), 640) + ';\n');
+    sb.add('  var _dadH:Float = ' + util.getFloat(get(dadM, 'h'), 640) + ';\n');
+    sb.add('  var _dadS:Float = ' + util.getFloat(get(dadM, 's'), 1) + ';\n');
+    sb.add('  var _dadIsPlayer:Bool = ' + util.getBool(get(dadM, 'op'), false) + ';\n');
+
+    sb.add('\n  public function new()\n');
+    sb.add('  {\n');
+    sb.add('    super("' + variantId + '");\n');
+    sb.add('  }\n');
+
+    sb.add('\n  override function addCharacter(character:BaseCharacter, charType:CharacterType):Void\n');
+    sb.add('  {\n');
+    sb.add('    super.addCharacter(character, charType);\n');
+    sb.add('    switch (charType)\n');
+    sb.add('    {\n');
+
+    // BF
+    sb.add('      case CharacterType.BF:\n');
+    sb.add('        var f:Float = (_bfIsPlayer == true) ? 1 : -1;\n');
+    sb.add('        character.x = _bfX + _bfRootX * f + character.width / 2;\n');
+    sb.add('        character.y = _bfY + _bfRootY + character.height * (1 + _bfScale * _bfS) / 2;\n');
+    sb.add('        character.originalPosition.set(character.x, character.y);\n');
+    sb.add('        character.scrollFactor.set(_bfScroll, _bfScroll);\n');
+    sb.add('        character.resetCameraFocusPoint();\n');
+    sb.add('        var fudgeX:Float = -100;\n');
+    sb.add('        character.cameraFocusPoint.x = character.x + _bfCamX + _bfRootX * (1 - f) + fudgeX;\n');
+    sb.add('        character.cameraFocusPoint.y = character.y + _bfCamY - 100;\n');
+
+    // DAD
+    sb.add('      case CharacterType.DAD:\n');
+    sb.add('        var f:Float = (false == _dadIsPlayer) ? 1 : -1;\n');
+    sb.add('        character.x = _dadX + _dadRootX * f + character.width / 2;\n');
+    sb.add('        character.y = _dadY + _dadRootY + character.height * (1 + _dadScale * _dadS) / 2;\n');
+    sb.add('        character.originalPosition.set(character.x, character.y);\n');
+    sb.add('        character.scrollFactor.set(_dadScroll, _dadScroll);\n');
+    sb.add('        character.resetCameraFocusPoint();\n');
+    sb.add('        var fudgeX:Float = 150;\n');
+    sb.add('        character.cameraFocusPoint.x = character.x + _dadCamX + _dadRootX * (1 - f) + fudgeX;\n');
+    sb.add('        character.cameraFocusPoint.y = character.y + _dadCamY - 100;\n');
+
+    // GF
+    sb.add('      case CharacterType.GF:\n');
+    sb.add('        var f:Float = (false == _gfIsPlayer) ? 1 : -1;\n');
+    sb.add('        character.x = _gfX + _gfRootX * f + character.width / 2;\n');
+    sb.add('        character.y = _gfY + _gfRootY + character.height * (1 + _gfScale * _gfS) / 2;\n');
+    sb.add('        character.originalPosition.set(character.x, character.y);\n');
+    sb.add('        character.scrollFactor.set(_gfScroll, _gfScroll);\n');
+    sb.add('        character.resetCameraFocusPoint();\n');
+    sb.add('        var fudgeX:Float = -100;\n');
+    sb.add('        character.cameraFocusPoint.x = character.x + _gfCamX + _gfRootX * (1 - f) + fudgeX;\n');
+    sb.add('        character.cameraFocusPoint.y = character.y + _gfCamY - 100;\n');
+
+    sb.add('    }\n');
+    sb.add('  }\n');
+    sb.add('}\n');
+
+    return sb.toString();
+  }
+
+  function sanitizeClassName(s:String):String
+  {
+    var result:String = StringTools.replace(s, ' ', '_');
+    result = StringTools.replace(result, '-', '_');
+    result = StringTools.replace(result, '.', '_');
+    result = StringTools.replace(result, '/', '_');
+    result = StringTools.replace(result, '\\', '_');
+    // Prefix with underscore if it starts with a digit.
+    if (result.length > 0 && result.charCodeAt(0) >= 48 && result.charCodeAt(0) <= 57) result = '_' + result;
+    if (result.length == 0) result = '_unnamed';
+    return result;
+  }
+
+  // ------------------------------------------------------------------
+  // Image sweep: every PNG/XML under the mod's images/ folder.
+  // ------------------------------------------------------------------
+
+  public function sweepImages(dir:String, out:Dynamic):Void
+  {
+    var files:Array<String> = util.listFilesRecursive('mods/$dir/images', 8);
+    for (rel in files)
+    {
+      var lower:String = rel.toLowerCase();
+      if (StringTools.endsWith(lower, '.png'))
+      {
+        // Noteskins/splashes may be referenced by imported songs - keep
+        // them. Everything else under images/ is only ever rendered by
+        // scripts that cannot run in V-Slice, so skip the PNG (skipping the
+        // decode also prevents the huge boot-time RAM/load hit from mods
+        // that ship many large stage/effect images).
+        if (StringTools.startsWith(lower, 'notes/') || StringTools.startsWith(lower, 'splashes/'))
+        {
+          addImage(out, dir, rel);
+        }
+      }
+      else if (StringTools.endsWith(lower, '.xml'))
+      {
+        // Character/stage atlases are registered precisely by the
+        // character/stage converters (with per-mod namespaced keys when ids
+        // collide) - a raw registration here would let a later mod's sweep
+        // override an earlier mod's correctly-keyed art. UI/font/UI-atlases
+        // still register here.
+        if (StringTools.startsWith(lower, 'characters/')) continue;
+        if (StringTools.startsWith(lower, 'stages/')) continue;
+        var text:String = util.readText('mods/$dir/images/$rel');
+        if (text != null)
+        {
+          out.texts.push({paths: util.imageKeys(rel), content: text});
+        }
+      }
+    }
+  }
+
+  // Codename mods without a weeks.txt/weeks folder (or whose weeks have no
+  // chart data) still need their songs to show up in freeplay, which only
+  // lists songs through levels. Emit a virtual catch-all level so every
+  // imported song is reachable.
+  public function makeFallbackLevel(dir:String, out:Dynamic):Void
+  {
+    var levelId:String = 'fc-' + util.normalizeId(dir);
+    if (levelId == 'fc-' || out.levels.indexOf(levelId) != -1) levelId = 'fc-mod';
+    var levelData:Dynamic = {
+      version: '1.0.0',
+      name: dir,
+      titleAsset: 'storymenu/titles/$levelId',
+      props: [],
+      background: '#F9CF51',
+      songs: out.songs
+    };
+    addText(out, util.dataTextKeys('levels/$levelId.json'), util.stringify(levelData));
+    out.levels.push(levelId);
+    util.warn('Codename: no weeks found - generated fallback level "$levelId" with ${out.songs.length} song(s)');
+  }
+
+  // ------------------------------------------------------------------
+  // Entry point
+  // ------------------------------------------------------------------
+
+  public function convert(dir:String, out:Dynamic, ?detectedAspect:Int = 0):Void
+  {
+    trace('[FUNKY-COMPAT] (codename) $dir: songs...');
+    this.detectedAspect = (detectedAspect != null) ? detectedAspect : 0;
+    // Non-portable mod-root content, reported once per mod.
+    if (util.pathExists('mods/$dir/videos') && util.listDir('mods/$dir/videos').length > 0)
+    {
+      util.warn('Codename: videos in "$dir" are not portable to V-Slice');
+    }
+    if (util.pathExists('mods/$dir/data/dialogue'))
+    {
+      util.warn('Codename: dialogue in "$dir" is not portable to V-Slice');
+    }
+    if (util.pathExists('mods/$dir/data/scripts'))
+    {
+      util.warn('Codename: data/scripts in "$dir" (HScript) are not portable to V-Slice');
+    }
+    if (util.pathExists('mods/$dir/shaders') && util.listDir('mods/$dir/shaders').length > 0)
+    {
+      util.warn('Codename: custom shaders in "$dir" are not portable to V-Slice');
+    }
+    convertSongs(dir, out);
+    trace('[FUNKY-COMPAT] (codename) $dir: weeks...');
+    convertWeeks(dir, out);
+    if (out.levels.length == 0 && out.songs.length > 0) makeFallbackLevel(dir, out);
+    trace('[FUNKY-COMPAT] (codename) $dir: characters...');
+    convertCharacters(dir, out);
+    trace('[FUNKY-COMPAT] (codename) $dir: stages...');
+    convertStages(dir, out);
+    trace('[FUNKY-COMPAT] (codename) $dir: image sweep...');
+    sweepImages(dir, out);
+    trace('[FUNKY-COMPAT] (codename) $dir: done');
+  }
+
+  // ------------------------------------------------------------------
+  // Attribute parsing helpers
+  // ------------------------------------------------------------------
+
+  public function parseIntAttr(body:String, name:String, fallback:Int):Int
+  {
+    var raw:String = attr(body, name);
+    if (raw == null || raw == '') return fallback;
+    var v:Int = Std.parseInt(raw);
+    if (v == null) return fallback;
+    return v;
+  }
+
+  public function floatAttr(body:String, name:String, fallback:Float):Float
+  {
+    var raw:String = attr(body, name);
+    if (raw == null || raw == '') return fallback;
+    var v:Float = Std.parseFloat(raw);
+    if (Math.isNaN(v)) return fallback;
+    return v;
+  }
+
+  public function boolAttr(body:String, name:String, fallback:Bool):Bool
+  {
+    var raw:String = attr(body, name);
+    if (raw == null || raw == '') return fallback;
+    var lower:String = raw.toLowerCase();
+    if (lower == 'true') return true;
+    if (lower == 'false') return false;
+    return fallback;
+  }}

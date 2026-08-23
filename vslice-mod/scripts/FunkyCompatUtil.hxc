@@ -1,0 +1,1665 @@
+// funky-compat - shared utilities.
+// Sandbox-safe in-memory file reading + virtual asset cache injection.
+//
+// IMPORTANT: No files are ever written. Foreign mods are read from disk
+// (FileUtilSandboxed allows reads anywhere under the game directory) and
+// everything we produce lives in the openfl asset cache and the game's
+// registries, making V-Slice believe the converted files are mounted mods.
+
+import haxe.Json;
+import StringTools;
+import haxe.io.Bytes;
+import openfl.utils.ByteArray;
+import lime.graphics.Image;
+import lime.graphics.ImageBuffer;
+import lime.media.AudioBuffer;
+import funkin.Assets;
+import funkin.modding.PolymodHandler;
+import funkin.util.ReflectUtil;
+// 'funkin.util.FileUtil' is import-aliased by the game to the sandboxed
+// variant - used as a FALLBACK for paths that stay inside the game dir.
+import funkin.util.FileUtil;
+
+class FunkyCompatUtil
+{
+  public var warnings:Array<String>;
+
+  // The game's own mod file system (symlink- and zip-aware). It is the same
+  // layer the game uses to mount mods, so it can see mods that live outside
+  // the game directory via symlinks - which the sandboxed FileUtil cannot.
+  var gameFs:Dynamic;
+  var fsErrorShown:Bool;
+
+  public function new()
+  {
+    this.warnings = [];
+    this.gameFs = null;
+    this.fsErrorShown = false;
+    this.lazyImages = 0;
+    this.lazySounds = 0;
+    this.eagerImages = 0;
+    this.eagerSounds = 0;
+    this.caseCache = {};
+    this.dirListCache = {};
+    this.pngDimsCache = {};
+    this.foreignIds = {};
+    this.slugMap = {};
+    this.slugCounter = 0;
+  }
+
+  public function warn(msg:String):Void
+  {
+    this.warnings.push(msg);
+  }
+
+  // ------------------------------------------------------------------
+  // Layer config (mods/funky-compat/config.json) - shared by both
+  // importers so the aspect-ratio framing override works everywhere.
+  // ------------------------------------------------------------------
+
+  var layerCfgCache:Dynamic;
+
+  public function loadLayerConfig():Dynamic
+  {
+    if (this.layerCfgCache != null) return this.layerCfgCache;
+    this.layerCfgCache = {};
+    var cfgText:String = readText('mods/funky-compat/config.json');
+    if (cfgText != null)
+    {
+      // haxe.Json rejects comments - strip them defensively so an edited
+      // config with notes still parses.
+      var stripped:String = '';
+      var lines:Array<String> = cfgText.split('\n');
+      for (ln in lines)
+      {
+        var li:Int = ln.indexOf('//');
+        if (li >= 0) ln = ln.substring(0, li);
+        stripped += ln + '\n';
+      }
+      try
+      {
+        var parsed:Dynamic = Json.parse(stripped);
+        if (parsed != null) this.layerCfgCache = parsed;
+      }
+      catch (e:Dynamic)
+      {
+        this.warn('Failed to parse funky-compat config.json - using defaults');
+      }
+    }
+    return this.layerCfgCache;
+  }
+
+  // Target WORLD-CAMERA view width for a stage framed for a non-16:9
+  // ("square"/4:3-era) view, in the game's 1280x720 coordinate space. A
+  // stage designed for a 4:3 window shows 25% more world width than intended
+  // in V-Slice's 16:9 view; the converters emit a FunkyCompatAspect song
+  // event that pillar-boxes the world camera to this width (720 tall stays
+  // the same, so the vertical framing is untouched). Returns 0 when no
+  // aspect override applies. Configured per-stage (stageBias.<id>.aspect,
+  // checked against both the emitted and the raw stage id) or per-mod
+  // (modAspects.<modSlug>).
+  public function aspectViewW(modDir:String, ?stageKeys:Array<String>):Int
+  {
+    var cfg:Dynamic = loadLayerConfig();
+    if (cfg == null) return 0;
+
+    var target:String = '';
+    var stageBias:Dynamic = ReflectUtil.getField(cfg, 'stageBias');
+    if (stageBias != null && stageKeys != null)
+    {
+      for (k in stageKeys)
+      {
+        if (k == null || k == '') continue;
+        var over:Dynamic = ReflectUtil.getField(stageBias, k);
+        if (over == null) continue;
+        var a:Dynamic = ReflectUtil.getField(over, 'aspect');
+        if (a != null && Std.string(a) != '')
+        {
+          target = Std.string(a);
+          break;
+        }
+      }
+    }
+    if (target == '' && modDir != null && modDir != '')
+    {
+      var modAspects:Dynamic = ReflectUtil.getField(cfg, 'modAspects');
+      if (modAspects != null)
+      {
+        var m:Dynamic = ReflectUtil.getField(modAspects, normalizeId(modDir));
+        if (m != null && Std.string(m) != '') target = Std.string(m);
+      }
+    }
+    if (target == '') return 0;
+
+    // Accept "W:H" strings (4:3, 3:2, 5:4, ...) or a bare float factor.
+    var ratio:Float = 16.0 / 9.0;
+    var colon:Int = target.indexOf(':');
+    if (colon >= 0)
+    {
+      var wp:Float = Std.parseFloat(target.substring(0, colon));
+      var hp:Float = Std.parseFloat(target.substring(colon + 1));
+      if (Math.isNaN(wp) || Math.isNaN(hp) || hp <= 0) return 0;
+      ratio = wp / hp;
+    }
+    else
+    {
+      var f:Float = Std.parseFloat(target);
+      if (Math.isNaN(f) || f <= 0) return 0;
+      // A bare number is the zoom-style multiplier from the old knob - not a
+      // framing ratio; ignore it so stale configs stay harmless.
+      return 0;
+    }
+    // The game view is 720 tall in world space; frame that to the target
+    // ratio's width (4:3 -> 960). Only narrower-than-16:9 framing is useful.
+    var w:Int = Math.round(720 * ratio);
+    if (w >= 1280) return 0;
+    return w;
+  }
+
+  // ------------------------------------------------------------------
+  // Cross-mod id namespace: every emitted id (character, song, stage,
+  // level) lives in a GLOBAL namespace shared by all imported mods. Two
+  // foreign mods may define the same character ('alien', 'bf'...) or the
+  // same stage ('philly', 'stage'...) - without namespacing the later
+  // import silently overwrites the earlier one's asset-cache slots and the
+  // wrong mod's sprites render. Mods keep their pristine ids unless they
+  // collide with an id an earlier mod (or this run) already claimed.
+  // ------------------------------------------------------------------
+
+  var foreignIds:Dynamic;
+  var slugMap:Dynamic;
+  var slugCounter:Int;
+
+  public function isForeignTaken(cat:String, id:String):Bool
+  {
+    if (id == null || id == '') return false;
+    var group:Dynamic = ReflectUtil.getField(this.foreignIds, cat);
+    if (group == null) return false;
+    return ReflectUtil.getField(group, id) == true;
+  }
+
+  public function claimForeign(cat:String, id:String):Void
+  {
+    if (id == null || id == '') return;
+    var group:Dynamic = ReflectUtil.getField(this.foreignIds, cat);
+    if (group == null)
+    {
+      group = {};
+      ReflectUtil.setAnonymousField(this.foreignIds, cat, group);
+    }
+    ReflectUtil.setAnonymousField(group, id, true);
+  }
+
+  // ------------------------------------------------------------------
+  // Window-declaration based aspect detection
+  // ------------------------------------------------------------------
+
+  // Detect the aspect ratio a mod DECLARED for itself. Both Psych and
+  // Codename mods can resize their window at boot from data/global.hx (and
+  // other data/ scripts): gumballs calls `resizeWindow(960, 720)` at load,
+  // so its game genuinely runs at 960x720 (4:3) and its stages are framed
+  // for that view. Returns the equivalent view WIDTH in V-Slice's 720-tall
+  // space (960 for gumballs), or 0 when the mod declares a 16:9-or-wider
+  // window or nothing at all. Only literal constant arguments count -
+  // parameterized resize HANDLERS (windowResize(w,h), FlxG.resizeGame =
+  // newWidth...) that engines call reactively are not declarations. Custom
+  // wrapper functions are followed too (GUNLICK boots through its own
+  // `windowShit(1024, 768)` helper, which calls FlxG.resizeWindow
+  // internally), and restore calls in `destroy()` are ignored (they reset
+  // the window to 16:9 when the mod unloads).
+  public function detectModAspect(dir:String):Int
+  {
+    if (dir == null || dir == '') return 0;
+
+    // An explicit config entry for this mod wins over auto-detection
+    // ENTIRELY - including "16:9", which maps to 0 (keep the default
+    // framing). Without this, a configured 16:9 couldn't disable a detected
+    // square declaration (the importer would fall back to the detected width).
+    var cfg:Dynamic = loadLayerConfig();
+    if (cfg != null)
+    {
+      var modAspects:Dynamic = ReflectUtil.getField(cfg, 'modAspects');
+      if (modAspects != null)
+      {
+        var m:Dynamic = ReflectUtil.getField(modAspects, normalizeId(dir));
+        if (m != null && Std.string(m) != '')
+        {
+          // aspectViewW parses "W:H" and returns 0 for 16:9-or-wider.
+          return aspectViewW(dir, []);
+        }
+      }
+    }
+
+    var result:Int = 0;
+    var text:Null<String> = readText('mods/$dir/data/global.hx');
+    if (text != null) result = declaredViewWidth(text);
+    if (result > 0) return result;
+
+    // Some mods put the call in a data/scripts file instead.
+    var files:Array<String> = listFilesRecursive('mods/$dir/data', 2);
+    for (f in files)
+    {
+      if (!StringTools.endsWith(f.toLowerCase(), '.hx')) continue;
+      if (f == 'global.hx') continue;
+      var t2:Null<String> = readText('mods/$dir/data/$f');
+      if (t2 == null) continue;
+      result = declaredViewWidth(t2);
+      if (result > 0) return result;
+    }
+    return 0;
+  }
+
+  // Parse the first qualifying resize call in an hscript file; returns the
+  // view width (= 720 * W/H) or 0. Function definitions (`function
+  // resizeWindow(w, h)`) and variable-argument calls are skipped because
+  // their arguments aren't constants, and anything inside a `destroy()`
+  // body is skipped because that is the mod's unload-time window RESTORE,
+  // not its boot declaration (GUNLICK resets to 1280x720 there, before its
+  // real 1024x768 boot call appears in the file).
+  function declaredViewWidth(text:String):Int
+  {
+    // Custom helper functions whose bodies actually resize the window
+    // (GUNLICK's windowShit(w, h, ?scale) -> FlxG.resizeWindow etc). Their
+    // own literal invocations are boot declarations too.
+    var helperNames:Array<String> = findResizeHelpers(text);
+    var patterns:Array<String> = ['resizeWindow(', 'window.resize(', 'FlxG.resizeGame(', 'FlxG.resizeWindow('];
+    for (n in helperNames)
+    {
+      if (patterns.indexOf(n + '(') == -1) patterns.push(n + '(');
+    }
+
+    // Brace ranges of every `function destroy` body in this file.
+    var destroyRanges:Array<Dynamic> = findFunctionBodyRanges(text, 'destroy');
+
+    // Earliest qualifying LITERAL-args resize call (by file position, so a
+    // helper invoked before a direct API call still wins).
+    var bestIdx:Int = -1;
+    var bestViewW:Int = 0;
+    for (p in patterns)
+    {
+      var at:Int = 0;
+      while (at < text.length)
+      {
+        var idx:Int = text.indexOf(p, at);
+        if (idx < 0) break;
+        // Skip function definitions (`function resizeWindow(...)`).
+        var pre:Int = idx - 9;
+        if (pre >= 0 && text.substring(pre, idx) == 'function ')
+        {
+          at = idx + p.length;
+          continue;
+        }
+        // Skip window restores that run when the mod unloads.
+        if (!insideRanges(idx, destroyRanges))
+        {
+          var close:Int = text.indexOf(')', idx + p.length);
+          if (close > 0)
+          {
+            var args:String = text.substring(idx + p.length, close);
+            var comma:Int = args.indexOf(',');
+            if (comma > 0)
+            {
+              var wStr:String = StringTools.trim(args.substring(0, comma));
+              var hStr:String = StringTools.trim(args.substring(comma + 1));
+              var w:Float = Std.parseFloat(wStr);
+              var h:Float = Std.parseFloat(hStr);
+              // Non-numeric args = reactive handler, not a declaration.
+              if (!Math.isNaN(w) && !Math.isNaN(h) && w > 0 && h > 0)
+              {
+                var viewW:Int = Math.round(720 * w / h);
+                if (bestIdx < 0 || idx < bestIdx)
+                {
+                  bestIdx = idx;
+                  bestViewW = viewW;
+                }
+              }
+            }
+          }
+        }
+        at = idx + p.length;
+      }
+    }
+    // A 16:9-or-wider declaration (or nothing at all) means no re-framing.
+    if (bestViewW > 0 && bestViewW < 1280) return bestViewW;
+    return 0;
+  }
+
+  // Names of user-defined functions whose bodies contain a real window
+  // resize API call. These are boot-time window setters (not reactive
+  // handlers): their own literal invocations declare the mod's view size
+  // even though the function name isn't a stock API (GUNLICK: windowShit).
+  function findResizeHelpers(text:String):Array<String>
+  {
+    var out:Array<String> = [];
+    if (text == null) return out;
+    var apiTokens:Array<String> = ['resizeWindow(', 'window.resize(', 'FlxG.resizeWindow(', 'FlxG.resizeGame(', 'setWindowSize(', 'setGameSize('];
+    var pos:Int = 0;
+    while (true)
+    {
+      var f:Int = text.indexOf('function ', pos);
+      if (f < 0) break;
+      var nameStart:Int = f + 9;
+      var nameEnd:Int = text.indexOf('(', nameStart);
+      if (nameEnd < 0) break;
+      var name:String = StringTools.trim(text.substring(nameStart, nameEnd));
+      if (name != '')
+      {
+        var body:String = functionBodyText(text, nameEnd);
+        if (body != null)
+        {
+          for (t in apiTokens)
+          {
+            if (body.indexOf(t) != -1)
+            {
+              if (out.indexOf(name) == -1) out.push(name);
+              break;
+            }
+          }
+        }
+      }
+      pos = nameEnd + 1;
+    }
+    return out;
+  }
+
+  // Text of the brace-balanced body starting after the given `(` (the
+  // function's parameter list), or null. Used to judge whether a function
+  // performs a real window resize.
+  function functionBodyText(text:String, openParen:Int):String
+  {
+    if (text == null || openParen < 0) return null;
+    var depth:Int = 0;
+    var i:Int = openParen;
+    var closeParen:Int = -1;
+    while (i < text.length)
+    {
+      var c:String = text.charAt(i);
+      if (c == '(') depth++;
+      else if (c == ')')
+      {
+        depth--;
+        if (depth == 0)
+        {
+          closeParen = i;
+          break;
+        }
+      }
+      i++;
+    }
+    if (closeParen < 0) return null;
+    var brace:Int = text.indexOf('{', closeParen);
+    if (brace < 0) return null;
+    depth = 0;
+    i = brace;
+    var closeBrace:Int = -1;
+    while (i < text.length)
+    {
+      var ch:String = text.charAt(i);
+      if (ch == '{') depth++;
+      else if (ch == '}')
+      {
+        depth--;
+        if (depth == 0)
+        {
+          closeBrace = i;
+          break;
+        }
+      }
+      i++;
+    }
+    if (closeBrace < 0) return null;
+    return text.substring(brace, closeBrace);
+  }
+
+  // Brace ranges (as [start, end]) of every `function <name>` body in the
+  // file, so calls inside them can be excluded.
+  function findFunctionBodyRanges(text:String, name:String):Array<Dynamic>
+  {
+    var out:Array<Dynamic> = [];
+    if (text == null || name == null || name == '') return out;
+    var needle:String = 'function $name(';
+    var pos:Int = 0;
+    while (true)
+    {
+      var f:Int = text.indexOf(needle, pos);
+      if (f < 0) break;
+      var openParen:Int = text.indexOf('(', f);
+      var body:String = functionBodyText(text, openParen);
+      if (body != null)
+      {
+        var start:Int = text.indexOf('{', openParen);
+        out.push([start, start + body.length]);
+      }
+      pos = f + needle.length;
+    }
+    return out;
+  }
+
+  function insideRanges(idx:Int, ranges:Array<Dynamic>):Bool
+  {
+    if (ranges == null) return false;
+    for (r in ranges)
+    {
+      if (r == null) continue;
+      if (idx >= r[0] && idx < r[1]) return true;
+    }
+    return false;
+  }
+
+  // Stable per-mod suffix used when an emitted id collides with an earlier
+  // mod's id ('alien' + '17bucks...' -> 'alien-17bucksreleasebuild').
+  // Collision-free: if two different mod folders normalize to the same slug
+  // (or the first slug is taken), a numeric suffix is appended.
+  public function modSlug(dir:String):String
+  {
+    if (dir == null || dir == '') return 'mod';
+    var cached:Dynamic = ReflectUtil.getField(this.slugMap, dir);
+    if (cached != null) return Std.string(cached);
+    var base:String = normalizeId(dir);
+    if (base == '') base = 'mod';
+    if (base.length > 20) base = base.substring(0, 20);
+    var slug:String = base;
+    var collision:Bool = false;
+    for (key in ReflectUtil.fields(this.slugMap))
+    {
+      if (Std.string(ReflectUtil.getField(this.slugMap, key)) == slug)
+      {
+        collision = true;
+        break;
+      }
+    }
+    if (collision)
+    {
+      this.slugCounter++;
+      slug = base + this.slugCounter;
+    }
+    ReflectUtil.setAnonymousField(this.slugMap, dir, slug);
+    return slug;
+  }
+
+  // Returns rawId when free, otherwise '<id>-<modSlug>'. Resolution is
+  // deterministic for a given (cat, dir, rawId) during a mod's conversion
+  // because ids are only claimed by mods processed BEFORE this one.
+  public function disambiguateId(cat:String, dir:String, rawId:String):String
+  {
+    if (rawId == null || rawId == '') return rawId;
+    if (isForeignTaken(cat, rawId))
+    {
+      return rawId + '-' + modSlug(dir);
+    }
+    return rawId;
+  }
+
+  // Scan an audio folder for per-character vocal files (Voices-<name>.ogg,
+  // the Psych multi-vocal naming several dual-format mods ship). Returns
+  // [{name, entry}] where name is the lowercased vocal key and entry is a
+  // lazy/bytes file entry, or an empty array when no per-char vocals exist.
+  public function scanVoiceFiles(out:Dynamic, audioBase:String):Array<Dynamic>
+  {
+    var result:Array<Dynamic> = [];
+    if (audioBase == null || audioBase == '') return result;
+    var names:Array<String> = listDir(audioBase);
+    for (name in names)
+    {
+      var lower:String = name.toLowerCase();
+      if (!StringTools.startsWith(lower, 'voices-')) continue;
+      if (!StringTools.endsWith(lower, '.ogg') && !StringTools.endsWith(lower, '.mp3')) continue;
+      var vocalName:String = lower.substring('voices-'.length, lower.length - 4);
+      if (vocalName == '') continue;
+      // Skip the split-side naming (Voices-Player.ogg / Voices-Opponent.ogg) -
+      // that layout is handled by the importers' dedicated legacy paths, and
+      // treating them as per-character tracks would double-register them.
+      if (vocalName == 'player' || vocalName == 'opponent') continue;
+      var entry:Dynamic = resolveFileEntry(out, '$audioBase/$name');
+      if (entry == null) continue;
+      result.push({name: vocalName, entry: entry});
+    }
+    return result;
+  }
+
+  // ------------------------------------------------------------------
+  // Filesystem helpers (game file system first, sandbox fallback)
+  // ------------------------------------------------------------------
+
+  public function ensureFs():Bool
+  {
+    if (this.gameFs != null) return true;
+    try
+    {
+      // Private static on PolymodHandler, populated at boot by the game.
+      this.gameFs = PolymodHandler.modFileSystem;
+    }
+    catch (e:Dynamic)
+    {
+      this.gameFs = null;
+    }
+    if (this.gameFs == null)
+    {
+      if (!this.fsErrorShown)
+      {
+        this.fsErrorShown = true;
+        this.warn('Game mod file system unavailable - foreign mods outside the game dir will not be importable');
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // Safe existence check (never segfaults: exists() itself resolves safely).
+  public function fsExists(relPath:String):Bool
+  {
+    try
+    {
+      return this.gameFs.exists(relPath);
+    }
+    catch (e:Dynamic)
+    {
+      return false;
+    }
+  }
+
+  // List entries of a directory (path relative to the game directory).
+  // readDirectory() segfaults on unresolvable paths, so it is only ever
+  // called after fsExists() confirmed the path resolves.
+  public function listDir(relPath:String):Array<String>
+  {
+    if (ensureFs())
+    {
+      if (!fsExists(relPath)) return [];
+      try
+      {
+        var entries:Array<String> = this.gameFs.readDirectory(relPath);
+        if (entries != null) return normalizeEntries(entries);
+      }
+      catch (e:Dynamic)
+      {
+        // fall through to sandbox
+      }
+    }
+
+    var entries:Array<String> = null;
+    try
+    {
+      entries = FileUtil.readDir(relPath);
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('listDir($relPath) failed: $e');
+      return [];
+    }
+    return normalizeEntries(entries);
+  }
+
+  public function normalizeEntries(entries:Array<String>):Array<String>
+  {
+    var result:Array<String> = [];
+    for (entry in entries)
+    {
+      var name:String = entry;
+      var idx:Int = name.lastIndexOf('/');
+      if (idx >= 0) name = name.substring(idx + 1);
+      idx = name.lastIndexOf('\\');
+      if (idx >= 0) name = name.substring(idx + 1);
+      if (name != '' && name != '.' && name != '..') result.push(name);
+    }
+    return result;
+  }
+
+  public function pathExists(relPath:String):Bool
+  {
+    // The game file system is the single authority when available; the
+    // sandboxed fallback below would "reject" paths that live outside the
+    // game dir by returning the game dir itself (which exists), corrupting
+    // the probe result.
+    if (ensureFs()) return fsExists(relPath);
+    try
+    {
+      return FileUtil.pathExists(relPath);
+    }
+    catch (e:Dynamic)
+    {
+      return false;
+    }
+  }
+
+  public function fileExists(relPath:String):Bool
+  {
+    if (ensureFs())
+    {
+      if (!fsExists(relPath)) return false;
+      return !fsIsDir(relPath);
+    }
+    try
+    {
+      return FileUtil.fileExists(relPath);
+    }
+    catch (e:Dynamic)
+    {
+      return false;
+    }
+  }
+
+  // Only called AFTER fsExists() returned true, so the path resolves and the
+  // underlying sys call cannot receive null.
+  public function fsIsDir(relPath:String):Bool
+  {
+    try
+    {
+      return this.gameFs.isDirectory(relPath);
+    }
+    catch (e:Dynamic)
+    {
+      return false;
+    }
+  }
+
+  // Join path segments with forward slashes.
+  public function join(a:String, b:String):String
+  {
+    if (a == null || a == '') return b;
+    if (b == null || b == '') return a;
+    if (StringTools.endsWith(a, '/')) return a + b;
+    return a + '/' + b;
+  }
+
+  public function readText(relPath:String):Null<String>
+  {
+    if (!fileExists(relPath)) return null;
+    if (ensureFs())
+    {
+      try
+      {
+        var content:Null<String> = this.gameFs.getFileContent(relPath);
+        if (content != null) return content;
+      }
+      catch (e:Dynamic)
+      {
+        // fall through
+      }
+    }
+    var result:String = null;
+    try
+    {
+      result = FileUtil.readStringFromPath(relPath);
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('Failed to read $relPath: $e');
+      return null;
+    }
+    return result;
+  }
+
+  public function readBytes(relPath:String):Null<ByteArray>
+  {
+    if (!fileExists(relPath)) return null;
+    if (ensureFs())
+    {
+      try
+      {
+        var bytes = this.gameFs.getFileBytes(relPath);
+        if (bytes != null) return ByteArray.fromBytes(bytes);
+      }
+      catch (e:Dynamic)
+      {
+        // fall through
+      }
+    }
+    var bytes = null;
+    try
+    {
+      bytes = FileUtil.readBytesFromPath(relPath);
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('Failed to read bytes from $relPath: $e');
+      return null;
+    }
+    if (bytes == null) return null;
+    return ByteArray.fromBytes(bytes);
+  }
+
+  public function readJson(relPath:String):Null<Dynamic>
+  {
+    var text:String = readText(relPath);
+    if (text == null || text == '') return null;
+    try
+    {
+      return Json.parse(text);
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('Failed to parse JSON $relPath: $e');
+      return null;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Identifier normalization (matches how IDs are looked up)
+  // ------------------------------------------------------------------
+
+  // Lowercase + strip everything that isn't alphanumeric.
+  public function normalizeId(raw:String):String
+  {
+    if (raw == null) return '';
+    var lower:String = raw.toLowerCase();
+    var out:String = '';
+    for (i in 0...lower.length)
+    {
+      var ch:String = lower.charAt(i);
+      if (isAlnum(ch)) out += ch;
+    }
+    return out;
+  }
+
+  public function isAlnum(ch:String):Bool
+  {
+    return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+  }
+
+  // ------------------------------------------------------------------
+  // Cache key alias expansion
+  // ------------------------------------------------------------------
+
+  // Keys for a preload (default) data file: assets/data/<rel>
+  public function dataTextKeys(rel:String):Array<String>
+  {
+    return ['assets/data/$rel'];
+  }
+
+  // Register the layer's transparent placeholder under the health-icon key
+  // V-Slice asks for (icons/icon-<charId>). Imported mods ship health icons
+  // in too many formats to support faithfully, so they render as invisible
+  // instead. The transparent PNG ships inside the layer mod itself
+  // (assets/images/transparent.png), so it works for folder and zip mods;
+  // iconExists() stays true (the key is registered) so V-Slice never
+  // falls back to the visible placeholder face.
+  public function registerTransparentIcon(out:Dynamic, charId:String):Void
+  {
+    if (charId == null || charId == '') return;
+    var entry:Dynamic = resolveFileEntry(out, 'mods/funky-compat/assets/images/transparent.png');
+    if (entry == null) return;
+    out.images.push({paths: imageKeys('icons/icon-$charId.png'), bytes: entry.bytes, file: entry.file});
+  }
+
+  // Keys for an image: preload + shared library (the prefixed form is what
+  // the game actually queries).
+  public function imageKeys(rel:String):Array<String>
+  {
+    return ['assets/images/$rel', 'shared:assets/shared/images/$rel'];
+  }
+
+  // Keys for song audio: songs:assets/songs/<songId>/<file>
+  public function songAudioKeys(songId:String, file:String):Array<String>
+  {
+    return ['songs:assets/songs/$songId/$file', 'assets/songs/$songId/$file'];
+  }
+
+  // ------------------------------------------------------------------
+  // Virtual asset injection (via the libraries' fallback asset maps)
+  //
+  // The openfl AssetCache object is unusable from scripts (its methods do
+  // not resolve), so we inject directly into the storage maps of the game's
+  // AssetLibrary objects instead: types/sizes (so exists() passes) and the
+  // cached* maps (so getText/getImage/getAudioBuffer return our data).
+  // Verified empirically: after these writes, Assets.exists()/getText()
+  // return the injected content exactly like a mounted mod file.
+  // ------------------------------------------------------------------
+
+  var textType:Dynamic;
+  var imageType:Dynamic;
+  var musicType:Dynamic;
+  var soundType:Dynamic;
+  var enumsReady:Bool;
+
+  // Lazy vs eager counters (for boot diagnostics).
+  public var lazyImages:Int;
+  public var lazySounds:Int;
+  public var eagerImages:Int;
+  public var eagerSounds:Int;
+
+  // Steal real AssetType enum values from assets the game already knows.
+  function ensureTypeEnums():Bool
+  {
+    if (this.enumsReady) return true;
+    this.enumsReady = true;
+    try
+    {
+      var def:Dynamic = Assets.getLibrary('default');
+      var defBase:Dynamic = ReflectUtil.getField(def, 'fallback');
+      var defTypes:Dynamic = ReflectUtil.getField(defBase, 'types');
+      this.textType = defTypes.get('assets/data/songs/tutorial/tutorial-metadata.json');
+
+      var sh:Dynamic = Assets.getLibrary('shared');
+      var shBase:Dynamic = ReflectUtil.getField(sh, 'fallback');
+      var shTypes:Dynamic = ReflectUtil.getField(shBase, 'types');
+      this.imageType = shTypes.get('shared:assets/shared/images/healthBar.png');
+      if (this.imageType == null) this.imageType = shTypes.get('assets/shared/images/healthBar.png');
+      if (this.imageType == null) this.imageType = defTypes.get('assets/images/healthBar.png');
+      this.soundType = shTypes.get('shared:assets/shared/sounds/cancelMenu.ogg');
+      if (this.soundType == null) this.soundType = shTypes.get('assets/shared/sounds/cancelMenu.ogg');
+
+      var sg:Dynamic = Assets.getLibrary('songs');
+      var sgBase:Dynamic = ReflectUtil.getField(sg, 'fallback');
+      var sgTypes:Dynamic = ReflectUtil.getField(sgBase, 'types');
+      this.musicType = sgTypes.get('songs:assets/songs/tutorial/Inst.ogg');
+      if (this.musicType == null) this.musicType = sgTypes.get('assets/songs/tutorial/Inst.ogg');
+      if (this.soundType == null) this.soundType = this.musicType;
+      if (this.musicType == null) this.musicType = this.soundType;
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('Could not steal asset type enums: $e');
+    }
+    var ok:Bool = (this.textType != null && this.imageType != null);
+    trace('[FUNKY-COMPAT] enums: text=' + (this.textType != null) + ' image=' + (this.imageType != null) + ' music=' + (this.musicType != null) + ' sound=' + (this.soundType != null));
+    return ok;
+  }
+
+  // Pick the library object for a fully-qualified asset id.
+  function libraryFor(fullId:String):Dynamic
+  {
+    var colon:Int = fullId.indexOf(':');
+    var libName:String = 'default';
+    if (colon >= 0)
+    {
+      libName = fullId.substring(0, colon);
+    }
+    try
+    {
+      var lib:Dynamic = Assets.getLibrary(libName);
+      if (lib == null) return null;
+      return ReflectUtil.getField(lib, 'fallback');
+    }
+    catch (e:Dynamic)
+    {
+      return null;
+    }
+  }
+
+  // lime's LibrarySymbol strips the 'lib:' prefix before querying a
+  // library's types/cached* maps, so prefixed ids must ALSO be registered
+  // under their unprefixed symbol name ('songs:assets/songs/x/Inst.ogg'
+  // -> 'assets/songs/x/Inst.ogg' in the 'songs' library). Registering both
+  // forms covers every lookup path.
+  function libraryKeys(fullId:String):Array<String>
+  {
+    var keys:Array<String> = [fullId];
+    var colon:Int = fullId.indexOf(':');
+    if (colon >= 0)
+    {
+      var bare:String = fullId.substring(colon + 1);
+      if (keys.indexOf(bare) == -1) keys.push(bare);
+    }
+    return keys;
+  }
+
+  // Strip a 'lib:' prefix (the form the lime library lookup actually uses).
+  public function bareKey(fullId:String):String
+  {
+    var colon:Int = fullId.indexOf(':');
+    if (colon < 0) return fullId;
+    return fullId.substring(colon + 1);
+  }
+
+  // Turn a game-dir-relative path into an absolute path lime can read
+  // directly (for on-demand asset loading straight from disk). Returns null
+  // if the game directory can't be determined.
+  //
+  // NOTE: in scripts, 'funkin.util.FileUtil' is aliased to the SANDBOXED
+  // variant, which has sanitizePath() but no gameDirectory field. We obtain
+  // the absolute game directory from sanitizePath('') and join manually -
+  // NOT sanitizePath(relPath), which would resolve symlinked mod paths to a
+  // path outside the game dir and silently yield the game dir itself.
+  public function resolveDiskPath(relPath:String):Null<String>
+  {
+    if (relPath == null || relPath == '') return null;
+    var gd:String = null;
+    try
+    {
+      gd = FileUtil.sanitizePath('');
+    }
+    catch (e:Dynamic)
+    {
+      gd = null;
+    }
+    if (gd == null || gd == '')
+    {
+      try
+      {
+        gd = ReflectUtil.getField(FileUtil, 'gameDirectory');
+        if (gd != null && gd == '') gd = null;
+      }
+      catch (e:Dynamic)
+      {
+        gd = null;
+      }
+    }
+    if (gd == null || gd == '') return null;
+    var p:String = relPath;
+    while (StringTools.startsWith(p, './')) p = p.substring(2);
+    while (StringTools.startsWith(p, '/')) p = p.substring(1);
+    if (p == '') return null;
+    if (StringTools.endsWith(gd, '/') || StringTools.endsWith(gd, '\\')) return gd + p;
+    return gd + '/' + p;
+  }
+
+  // Prepare a file for lazy injection. Folder-based mods resolve to an
+  // on-disk path (no bytes read); zip-based mods fall back to in-memory
+  // bytes (out.isZip). Returns {bytes, file} or null if the file is missing.
+  //
+  // The on-disk path is case-corrected: polymod's fileExists() matches
+  // case-insensitively, but lime opens paths with the exact bytes, so a
+  // path whose case differs from disk (e.g. an XML-referenced icon named
+  // 'Mado.png' while the file is 'mado.png') would fail at load time.
+  public function resolveFileEntry(out:Dynamic, relPath:String):Null<Dynamic>
+  {
+    if (out != null && out.isZip == true)
+    {
+      var bytes:Dynamic = readBytes(relPath);
+      if (bytes == null) return null;
+      return {bytes: bytes, file: null};
+    }
+    if (!fileExists(relPath)) return null;
+    var exact:Null<String> = exactCasePath(relPath);
+    if (exact != null)
+    {
+      // Some mods ship their real art in a NESTED 'mods/' copy while the
+      // top level holds a 1x1 placeholder PNG (double-nested zip layout,
+      // e.g. 17Bucks' bg/bckrom.png). When the primary file is a tiny stub,
+      // prefer the nested copy so the real texture loads.
+      var nested:Null<String> = nestedModPath(relPath);
+      if (nested != null && StringTools.endsWith(relPath.toLowerCase(), '.png'))
+      {
+        var exactNested:Null<String> = exactCasePath(nested);
+        if (exactNested != null && exactNested != exact && isPngStub(exact))
+        {
+          return {bytes: null, file: exactNested};
+        }
+      }
+      return {bytes: null, file: exact};
+    }
+    // Couldn't case-resolve; fall back to reading the bytes in-memory so
+    // the asset still registers (eager, via the case-insensitive game FS).
+    var bytes:Dynamic = readBytes(relPath);
+    if (bytes == null) return null;
+    return {bytes: bytes, file: null};
+  }
+
+  // 'mods/<dir>/x/y' -> 'mods/<dir>/mods/x/y' - the nested copy some
+  // double-zipped mods ship. Returns null when the path isn't a mod path.
+  public function nestedModPath(relPath:String):Null<String>
+  {
+    if (relPath == null || !StringTools.startsWith(relPath, 'mods/')) return null;
+    var rest:String = relPath.substring(5);
+    var slash:Int = rest.indexOf('/');
+    if (slash < 0) return null;
+    return 'mods/' + rest.substring(0, slash) + '/mods/' + rest.substring(slash + 1);
+  }
+
+  // True when a PNG is a tiny placeholder (<= 4x4).
+  public function isPngStub(relPath:String):Bool
+  {
+    var dims:Dynamic = pngDims(relPath);
+    if (dims == null || dims.length < 2) return false;
+    return utilFloat(dims[0]) <= 4 && utilFloat(dims[1]) <= 4;
+  }
+
+  var caseCache:Dynamic;
+  var dirListCache:Dynamic;
+
+  // Resolve a path to its exact-case on-disk form by walking each segment
+  // and matching directory entries exactly, then case-insensitively. Returns
+  // null if any level can't be resolved (caller should fall back).
+  public function exactCasePath(relPath:String):Null<String>
+  {
+    if (relPath == null || relPath == '') return null;
+    if (ReflectUtil.getField(this.caseCache, relPath) != null) return ReflectUtil.getField(this.caseCache, relPath);
+    var segs:Array<String> = relPath.split('/');
+    var cur:String = '';
+    var out:Array<String> = [];
+    for (i in 0...segs.length)
+    {
+      var seg:String = segs[i];
+      if (seg == null || seg == '') return null;
+      if (i == 0)
+      {
+        // Trust our own path prefixes ('mods', 'music', ...).
+        out.push(seg);
+        cur = seg;
+        continue;
+      }
+      var entries:Array<String> = listDirCached(cur);
+      if (entries == null || entries.length == 0) return null;
+      var exact:Null<String> = null;
+      for (e in entries)
+      {
+        if (e == seg)
+        {
+          exact = e;
+          break;
+        }
+      }
+      if (exact == null)
+      {
+        var lower:String = seg.toLowerCase();
+        for (e in entries)
+        {
+          if (e.toLowerCase() == lower)
+          {
+            exact = e;
+            break;
+          }
+        }
+      }
+      if (exact == null) return null;
+      out.push(exact);
+      cur = cur + '/' + exact;
+    }
+    var result:String = out.join('/');
+    ReflectUtil.setAnonymousField(this.caseCache, relPath, result);
+    return result;
+  }
+
+  // Directory listing with a by-path cache (exact-case names, game FS).
+  public function listDirCached(relPath:String):Array<String>
+  {
+    if (ReflectUtil.getField(this.dirListCache, relPath) != null) return ReflectUtil.getField(this.dirListCache, relPath);
+    var entries:Array<String> = listDir(relPath);
+    ReflectUtil.setAnonymousField(this.dirListCache, relPath, entries);
+    return entries;
+  }
+
+  var pngDimsCache:Dynamic;
+
+  // Read a PNG's pixel dimensions from its header (no full decode, just the
+  // IHDR width/height). Returns [w, h] or null. Used to convert top-left
+  // prop positions into V-Slice's center-based prop positions.
+  public function pngDims(relPath:String):Dynamic
+  {
+    if (relPath == null || relPath == '') return null;
+    if (ReflectUtil.getField(this.pngDimsCache, relPath) != null) return ReflectUtil.getField(this.pngDimsCache, relPath);
+    var dims:Dynamic = null;
+    try
+    {
+      var bytes:Dynamic = readBytes(relPath);
+      if (bytes != null && bytes.length >= 24)
+      {
+        // PNG signature (8) + IHDR: width at 16, height at 20 (big-endian).
+        var w:Int = (bytes.get(16) << 24) | (bytes.get(17) << 16) | (bytes.get(18) << 8) | bytes.get(19);
+        var h:Int = (bytes.get(20) << 24) | (bytes.get(21) << 16) | (bytes.get(22) << 8) | bytes.get(23);
+        if (w > 0 && h > 0) dims = [w, h];
+      }
+    }
+    catch (e:Dynamic)
+    {
+      dims = null;
+    }
+    ReflectUtil.setAnonymousField(this.pngDimsCache, relPath, dims);
+    return dims;
+  }
+
+  // Prop image dimensions, preferring the sparrow atlas (frameWidth/Height)
+  // and falling back to the PNG header. Returns {w, h} or null.
+  public function spriteDims(xmlText:Null<String>, pngPath:Null<String>):Dynamic
+  {
+    if (xmlText != null)
+    {
+      // Reuse a simple scan for the first SubTexture frame dimensions.
+      var fwIdx:Int = xmlText.indexOf('frameWidth="');
+      if (fwIdx >= 0)
+      {
+        var rest:String = xmlText.substring(fwIdx + 'frameWidth="'.length);
+        var e1:Int = rest.indexOf('"');
+        var fhIdx:Int = xmlText.indexOf('frameHeight="');
+        var w:Float = Std.parseFloat(e1 > 0 ? rest.substring(0, e1) : '');
+        if (Math.isNaN(w)) w = 0;
+        if (fhIdx >= 0)
+        {
+          var rest2:String = xmlText.substring(fhIdx + 'frameHeight="'.length);
+          var e2:Int = rest2.indexOf('"');
+          var h:Float = Std.parseFloat(e2 > 0 ? rest2.substring(0, e2) : '');
+          if (Math.isNaN(h)) h = 0;
+          if (w > 0 && h > 0) return {w: w, h: h};
+        }
+      }
+    }
+    if (pngPath != null)
+    {
+      var dims:Dynamic = pngDims(pngPath);
+      if (dims != null && dims.length >= 2) return {w: utilFloat(dims[0]), h: utilFloat(dims[1])};
+    }
+    return null;
+  }
+
+  // ------------------------------------------------------------------
+  // PNG art metrics - where the DRAWN pixels sit inside a frame box.
+  // Stage art from foreign engines often has empty padding below the drawn
+  // characters (gumballs' highschool crowd: feet ~17px above the frame
+  // bottom) and transparent margins above the drawn ground surface (floor:
+  // ~19px). Planting the bare frames onto each other leaves that gap
+  // visible; these helpers measure the two offsets from the actual PNGs so
+  // the converted stage can plant the DRAWN feet onto the DRAWN ground.
+  // EVERYTHING here is best-effort: any failure returns 0 / null and the
+  // caller falls back to its old behavior. No files are written.
+  // ------------------------------------------------------------------
+
+  var pngMetricsCache:Dynamic;
+
+  // Raw file bytes as haxe.io.Bytes (the game's fs layer returns these
+  // directly; the sandboxed FileUtil fallback too).
+  public function readRawBytes(relPath:String):Null<Bytes>
+  {
+    if (!fileExists(relPath)) return null;
+    if (ensureFs())
+    {
+      try
+      {
+        var b:Dynamic = this.gameFs.getFileBytes(relPath);
+        if (b != null) return b;
+      }
+      catch (e:Dynamic) {}
+    }
+    try
+    {
+      return FileUtil.readBytesFromPath(relPath);
+    }
+    catch (e:Dynamic) {}
+    return null;
+  }
+
+  // Decode a PNG into an alpha grid using the game's own image decoder
+  // (lime.graphics.Image - the same native path every texture the game loads
+  // goes through, so it cannot crash the way a hand-rolled zlib inflate can).
+  // Returns {w, h, alpha: haxe.io.Bytes} (alpha[row*w + col], 0-255) or null.
+  public function decodePngAlpha(pngRel:String):Dynamic
+  {
+    if (pngMetricsCache == null) pngMetricsCache = {};
+    var cached:Dynamic = ReflectUtil.getField(this.pngMetricsCache, pngRel);
+    if (cached != null) return cached.w < 0 ? null : cached;
+    var out:Dynamic = null;
+    try
+    {
+      var data:Null<Bytes> = readRawBytes(pngRel);
+      if (data != null && data.length > 8)
+      {
+        var ba:ByteArray = ByteArray.fromBytes(data);
+        var img:Dynamic = Image.fromBytes(ba);
+        if (img != null && img.width > 0 && img.height > 0)
+        {
+          var w:Int = img.width;
+          var h:Int = img.height;
+          var alpha:Bytes = Bytes.alloc(w * h);
+          // Read alpha straight from the raw pixel buffer (a plain Bytes
+          // .get() loop - no per-pixel native calls that could crash the
+          // process the way Image.getPixel loops can). Lime's PNG decode
+          // yields a 32-bit format; the alpha byte sits at offset 3 for
+          // R/G/B/A variants and offset 0 for A/R/G/B variants.
+          var bd:Dynamic = img.buffer.data;
+          var fmt:String = '' + Std.string(img.buffer.format);
+          var aOff:Int = -1;
+          if (bd != null)
+          {
+            // lime's PixelFormat renders as an int on some cpp builds: 0 =
+            // RGBA32, 1 = ARGB32, 2 = BGRA32, 3 = ABGR32. Byte ordering:
+            // R,G,B,A for the RGBA/BGRA variants (alpha at byte 3), A,R,G,B
+            // for the ARGB/ABGR variants (alpha at byte 0).
+            if (fmt == '0' || fmt == '2' || StringTools.startsWith(fmt, 'RGBA') || StringTools.startsWith(fmt, 'BGRA'))
+            {
+              aOff = 3;
+            }
+            else if (fmt == '1' || fmt == '3' || StringTools.startsWith(fmt, 'ARGB') || StringTools.startsWith(fmt, 'ABGR'))
+            {
+              aOff = 0;
+            }
+          }
+          if (aOff >= 0)
+          {
+            // img.buffer.data is a typed-array view (length/byteLength) whose
+            // .buffer wraps the raw bytes as a lime ByteArray - a
+            // haxe.io.Bytes subclass. Its 'b' field IS the byte storage, and
+            // HScript cannot call methods on the view directly, so wrap that
+            // field in a plain Bytes (zero-copy) and scan it.
+            var hb:Bytes = null;
+            try
+            {
+              // bd is a typed-array view over the pixel storage; the view's
+              // .buffer wraps the raw bytes (lime Bytes). Pull its 'b' field
+              // and wrap it in a plain Bytes (zero-copy), verifying the size.
+              var buf:Dynamic = ReflectUtil.getField(bd, 'buffer');
+              var bufData:Dynamic = buf == null ? null : ReflectUtil.getField(buf, 'b');
+              if (bufData != null)
+              {
+                hb = Bytes.ofData(bufData);
+                if (hb != null && Math.abs(hb.length - bd.length) > 8) hb = null;
+              }
+            }
+            catch (e:Dynamic) {}
+            if (hb == null)
+            {
+              // Cannot read pixels safely; keep the old box-based behavior.
+              return null;
+            }
+            var stride:Int = w * 4;
+            for (y in 0...h)
+            {
+              var rowBase:Int = y * stride + aOff;
+              var outBase:Int = y * w;
+              for (x in 0...w)
+              {
+                alpha.set(outBase + x, hb.get(rowBase + x * 4));
+              }
+            }
+          }
+          else
+          {
+            for (i in 0...(w * h)) alpha.set(i, 255);
+          }
+          out = {w: w, h: h, alpha: alpha};
+        }
+      }
+    }
+    catch (e:Dynamic)
+    {
+      }
+    ReflectUtil.setAnonymousField(this.pngMetricsCache, pngRel, out == null ? {w: -1} : out);
+    return out;
+  }
+
+  // Lowest dense pixel row (from the box bottom) across a prop's atlas
+  // frames, in source pixels. The author's crowd art usually has a few empty
+  // rows of padding below the drawn feet; this returns how far up the drawn
+  // feet actually are. frames: [{tx, ty, cw, ch, fy, fh}]. 0 on failure.
+  public function propFeetInset(pngRel:String, frames:Array<Dynamic>):Int
+  {
+    if (frames == null || frames.length == 0) return 0;
+    var img:Dynamic = decodePngAlpha(pngRel);
+    if (img == null) return 0;
+    var W:Int = img.w;
+    var alpha:Bytes = img.alpha;
+    var best:Int = -1;
+    for (fr in frames)
+    {
+      var rx:Int = fieldInt(fr, 'tx');
+      var ry:Int = fieldInt(fr, 'ty');
+      var rw:Int = fieldInt(fr, 'cw');
+      var rh:Int = fieldInt(fr, 'ch');
+      var fy:Int = fieldInt(fr, 'fy');
+      var fh:Int = fieldInt(fr, 'fh');
+      if (rw <= 0 || rh <= 0 || fh <= 0 || ry + rh > img.h) continue;
+      var threshold:Int = Std.int(rw * 0.05);
+      if (threshold < 1) threshold = 1;
+      // Scan top-to-bottom, keeping the last dense row: that is the LOWEST
+      // dense row (the drawn feet). A descending `for (r in (rh-1)...-1)`
+      // would be clearer but descending ranges crash on some targets.
+      var feetRow:Int = -1;
+      for (r in 0...rh)
+      {
+        var cnt:Int = 0;
+        var base:Int = (ry + r) * W + rx;
+        for (x in 0...rw)
+        {
+          if (alpha.get(base + x) > 16) cnt++;
+        }
+        if (cnt >= threshold) feetRow = r;
+      }
+      if (feetRow >= 0)
+      {
+        var inset:Int = fh - 1 - (feetRow - fy);
+        if (inset < 0) inset = 0;
+        if (best < 0 || inset < best) best = inset;
+      }
+    }
+    return best < 0 ? 0 : best;
+  }
+
+  // Top dense row of a ground image (source px from the box top) - where its
+  // visible surface actually begins, below any transparent top margin.
+  // rect: {x, y, w, h, fy}. 0 on failure.
+  public function groundSurfaceInset(pngRel:String, rect:Dynamic):Int
+  {
+    if (rect == null) return 0;
+    var img:Dynamic = decodePngAlpha(pngRel);
+    if (img == null) return 0;
+    var W:Int = img.w;
+    var alpha:Bytes = img.alpha;
+    var rx:Int = fieldInt(rect, 'x');
+    var ry:Int = fieldInt(rect, 'y');
+    var rw:Int = fieldInt(rect, 'w');
+    var rh:Int = fieldInt(rect, 'h');
+    var fy:Int = fieldInt(rect, 'fy');
+    if (rw <= 0 || rh <= 0 || ry + rh > img.h) return 0;
+    var threshold:Int = Std.int(rw * 0.30);
+    if (threshold < 1) threshold = 1;
+    for (r in 0...rh)
+    {
+      var cnt:Int = 0;
+      var base:Int = (ry + r) * W + rx;
+      for (x in 0...rw)
+      {
+        if (alpha.get(base + x) > 16) cnt++;
+      }
+      if (cnt >= threshold)
+      {
+        var boxRow:Int = r - fy;
+        return boxRow < 0 ? 0 : boxRow;
+      }
+    }
+    return 0;
+  }
+
+  function fieldInt(o:Dynamic, k:String):Int
+  {
+    var v:Dynamic = ReflectUtil.getField(o, k);
+    if (v == null) return 0;
+    return Std.int(v);
+  }
+
+  public function utilFloat(v:Dynamic, fallback:Float = 0):Float
+  {
+    if (v == null) return fallback;
+    var f:Float = Std.parseFloat(Std.string(v));
+    if (Math.isNaN(f)) return fallback;
+    return f;
+  }
+
+  // Register a virtual TEXT file.
+  public function injectText(fullId:String, content:String):Bool
+  {
+    if (!ensureTypeEnums()) return false;
+    var base:Dynamic = libraryFor(fullId);
+    if (base == null) return false;
+    try
+    {
+      for (key in libraryKeys(fullId))
+      {
+        ReflectUtil.getField(base, 'types').set(key, this.textType);
+        ReflectUtil.getField(base, 'sizes').set(key, content.length);
+        ReflectUtil.getField(base, 'cachedText').set(key, content);
+      }
+      return true;
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('injectText($fullId) failed: $e');
+      return false;
+    }
+  }
+
+  // Debug: verify a virtual file is visible through the game's own APIs.
+  public function verifyVirtual(fullId:String):Bool
+  {
+    try
+    {
+      return Assets.exists(fullId) && Assets.getText(fullId) != null;
+    }
+    catch (e:Dynamic)
+    {
+      return false;
+    }
+  }
+
+  // Register a virtual image (PNG/JPEG bytes). When `onDisk` is a real file
+  // path (folder-based mods), the asset is registered by path instead and the
+  // game decodes it lazily on first use - no decode, no RAM at boot.
+  public function injectImage(fullId:String, bytes:Dynamic, ?onDisk:String):Bool
+  {
+    if (!ensureTypeEnums()) return false;
+    var base:Dynamic = libraryFor(fullId);
+    if (base == null) return false;
+    if (onDisk != null && onDisk != '')
+    {
+      var abs:String = resolveDiskPath(onDisk);
+      if (abs != null)
+      {
+        try
+        {
+          var bare:String = bareKey(fullId);
+          for (key in libraryKeys(fullId))
+          {
+            ReflectUtil.getField(base, 'types').set(key, this.imageType);
+            ReflectUtil.getField(base, 'sizes').set(key, bytes != null ? bytes.length : 1);
+          }
+          ReflectUtil.getField(base, 'paths').set(bare, abs);
+          this.lazyImages++;
+          return true;
+        }
+        catch (e:Dynamic)
+        {
+          this.warn('injectImage($fullId) lazy path failed: $e');
+        }
+      }
+    }
+    if (bytes == null || bytes.length == 0) return false;
+    var img:Dynamic = null;
+    try
+    {
+      img = Image.fromBytes(bytes);
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('Image decode failed for $fullId: $e');
+      return false;
+    }
+    if (img == null) return false;
+    try
+    {
+      for (key in libraryKeys(fullId))
+      {
+        ReflectUtil.getField(base, 'types').set(key, this.imageType);
+        ReflectUtil.getField(base, 'sizes').set(key, bytes.length);
+        ReflectUtil.getField(base, 'cachedImages').set(key, img);
+      }
+      this.eagerImages++;
+      return true;
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('injectImage($fullId) failed: $e');
+      return false;
+    }
+  }
+
+  // Register a virtual audio file (OGG/MP3 bytes). When `onDisk` is a real
+  // file path (folder-based mods), the asset is registered by path instead and
+  // the game decodes it lazily on first play - no decode, no RAM at boot.
+  public function injectAudio(fullId:String, bytes:Dynamic, isMusic:Bool, ?onDisk:String):Bool
+  {
+    if (!ensureTypeEnums()) return false;
+    var base:Dynamic = libraryFor(fullId);
+    if (base == null) return false;
+    var type:Dynamic = isMusic ? this.musicType : this.soundType;
+    if (type == null) type = this.soundType;
+    if (onDisk != null && onDisk != '')
+    {
+      var abs:String = resolveDiskPath(onDisk);
+      if (abs != null)
+      {
+        try
+        {
+          var bare:String = bareKey(fullId);
+          for (key in libraryKeys(fullId))
+          {
+            ReflectUtil.getField(base, 'types').set(key, type);
+            ReflectUtil.getField(base, 'sizes').set(key, bytes != null ? bytes.length : 1);
+          }
+          ReflectUtil.getField(base, 'paths').set(bare, abs);
+          this.lazySounds++;
+          return true;
+        }
+        catch (e:Dynamic)
+        {
+          this.warn('injectAudio($fullId) lazy path failed: $e');
+        }
+      }
+    }
+    if (bytes == null || bytes.length == 0) return false;
+    var buf:Dynamic = null;
+    try
+    {
+      buf = AudioBuffer.fromBytes(bytes);
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('Audio decode failed for $fullId: $e');
+      return false;
+    }
+    if (buf == null) return false;
+    try
+    {
+      for (key in libraryKeys(fullId))
+      {
+        ReflectUtil.getField(base, 'types').set(key, type);
+        ReflectUtil.getField(base, 'sizes').set(key, bytes.length);
+        ReflectUtil.getField(base, 'cachedAudioBuffers').set(key, buf);
+      }
+      this.eagerSounds++;
+      return true;
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('injectAudio($fullId) failed: $e');
+      return false;
+    }
+  }
+
+  // Create a blank 1x1 title image so imported weeks don't crash on missing
+  // art. (Injected straight into the default library's image store.)
+  public function cacheBlankTitle(levelId:String):Void
+  {
+    var img:Dynamic = null;
+    try
+    {
+      var buffer:Dynamic = new ImageBuffer(1, 1);
+      img = new Image(buffer);
+    }
+    catch (e:Dynamic)
+    {
+      return;
+    }
+    if (img == null) return;
+    var keys:Array<String> = ['assets/images/storymenu/titles/$levelId.png', 'shared:assets/shared/images/storymenu/titles/$levelId.png'];
+    var typesOk:Int = 0;
+    for (key in keys)
+    {
+      var base:Dynamic = libraryFor(key);
+      if (base == null) continue;
+      try
+      {
+        if (!ensureTypeEnums()) return;
+        for (mapKey in libraryKeys(key))
+        {
+          ReflectUtil.getField(base, 'types').set(mapKey, this.imageType);
+          ReflectUtil.getField(base, 'sizes').set(mapKey, 4);
+          ReflectUtil.getField(base, 'cachedImages').set(mapKey, img);
+        }
+        typesOk++;
+      }
+      catch (e:Dynamic)
+      {
+        // ignore
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Recursive file listing (bounded - guards against symlink cycles)
+  // ------------------------------------------------------------------
+
+  // List all FILES under a directory, relative to that directory.
+  // maxDepth bounds recursion; the result is capped to avoid pathological
+  // mods, so a symlink loop can never hang the game.
+  public function listFilesRecursive(relRoot:String, maxDepth:Int):Array<String>
+  {
+    var result:Array<String> = [];
+    if (!pathExists(relRoot)) return result;
+    walkRecursive(relRoot, '', 0, maxDepth, result);
+    return result;
+  }
+
+  public function walkRecursive(relRoot:String, rel:String, depth:Int, maxDepth:Int, out:Array<String>):Void
+  {
+    if (depth > maxDepth) return;
+    if (out.length >= 4096) return;
+    var abs:String = rel == '' ? relRoot : relRoot + '/' + rel;
+    var names:Array<String> = listDir(abs);
+    for (name in names)
+    {
+      if (name == '.' || name == '..') continue;
+      var childRel:String = rel == '' ? name : rel + '/' + name;
+      var childAbs:String = rel == '' ? abs + '/' + name : abs + '/' + name;
+      var isDir:Bool = pathExists(childAbs) && !fileExists(childAbs);
+      if (isDir)
+      {
+        walkRecursive(relRoot, childRel, depth + 1, maxDepth, out);
+      }
+      else
+      {
+        out.push(childRel);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Small JSON helpers
+  // ------------------------------------------------------------------
+
+  public function stringify(value:Dynamic):String
+  {
+    try
+    {
+      return Json.stringify(value);
+    }
+    catch (e:Dynamic)
+    {
+      this.warn('Failed to stringify JSON: $e');
+      return '{}';
+    }
+  }
+
+  // Convert [r, g, b] to '#RRGGBB'
+  public function rgbToHex(arr:Dynamic):String
+  {
+    if (arr == null) return '#FFFFFF';
+    var r:Int = getInt(arr[0]);
+    var g:Int = getInt(arr[1]);
+    var b:Int = getInt(arr[2]);
+    var value:Int = (r << 16) | (g << 8) | b;
+    var hex:String = StringTools.hex(value, 6);
+    return '#$hex';
+  }
+
+  public function getFloat(v:Dynamic, fallback:Float):Float
+  {
+    if (v == null) return fallback;
+    if (Std.isOfType(v, Float) || Std.isOfType(v, Int)) return v;
+    var s:String = Std.string(v);
+    var parsed:Float = Std.parseFloat(s);
+    if (Math.isNaN(parsed)) return fallback;
+    return parsed;
+  }
+
+  public function getInt(v:Dynamic, fallback:Int):Int
+  {
+    if (v == null) return fallback;
+    if (Std.isOfType(v, Int)) return v;
+    if (Std.isOfType(v, Float)) return Math.round(v);
+    var parsed:Float = Std.parseFloat(Std.string(v));
+    if (Math.isNaN(parsed)) return fallback;
+    return Math.round(parsed);
+  }
+
+  public function getBool(v:Dynamic, fallback:Bool):Bool
+  {
+    if (v == null) return fallback;
+    if (v == true) return true;
+    if (v == false) return false;
+    return fallback;
+  }
+
+  public function getString(v:Dynamic, fallback:String):String
+  {
+    if (v == null) return fallback;
+    return Std.string(v);
+  }
+}

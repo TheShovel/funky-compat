@@ -1,0 +1,35 @@
+{
+  // Section hidden from users: aspect re-framing is DETECTED automatically
+  // from each mod's own window declaration (a boot-time resize like
+  // `resizeWindow(960, 720)` in data/global.hx - e.g. gumballs). The
+  // overrides below only FORCE a value when that detection gets it wrong:
+  //   "modAspects": { "<modFolder>": "4:3" }  - whole mod,
+  //   "stageBias": { "<stageId>": { "aspect": "4:3" } } - one stage.
+  // The value is a "W:H" ratio; the world camera is pillar-boxed to it
+  // (black bars on the sides, same zoom and vertical extent).
+  "cameraBiasX": 0,
+  "cameraBiasY": 0,
+  "characterBiasX": 0,
+  "characterBiasY": 0,
+  "stageBias": {
+    // Per-stage overrides: x/y/camx/camy shift props & camera, gfY/bfY/dadY
+    // nudge that slot's anchor, zoom overrides the stage zoom, "aspect"
+    // forces a non-16:9 view width for a single stage (see above), and
+    // "crowdGround": false keeps an animated crowd (gumballs highschool etc.)
+    // at the author's ORIGINAL position from the Codename/XML file instead of
+    // planting its feet on the floor line (default true = grounded).
+    "the barracks settlement": {
+      "x": 0,
+      "y": 0
+    },
+    "stage": {
+      "gfY": 55
+    },
+    "philly": {
+      "gfY": 55
+    },
+    "spooky": {
+      "gfY": 55
+    }
+  }
+}

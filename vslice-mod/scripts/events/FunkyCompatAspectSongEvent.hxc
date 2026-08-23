@@ -1,0 +1,378 @@
+import funkin.play.event.SongEvent;
+import funkin.play.PlayState;
+import funkin.graphics.FunkinSprite;
+import funkin.graphics.shaders.HSVShader;
+import flixel.FlxG;
+import flixel.FlxCamera;
+
+// funky-compat - square/4:3-aspect re-framing hook.
+//
+// Mods that declare a non-16:9 window at boot (a literal resize call like
+// `resizeWindow(960, 720)` in data/global.hx - e.g. gumballs) frame their
+// stages for a narrower view than V-Slice's 16:9. This scripted song event
+// switches those songs to a 4:3 presentation:
+//
+//   1. Two black bars are drawn on a DEDICATED STATIC camera (created and
+//      added on top of the camera stack) - a pure screen-space overlay that
+//      never bops/tracks with the HUD's per-beat camera motion.
+//   2. The note strumlines are moved to MIDDLE SCROLL (centered lanes), and
+//      the WHOLE enemy side - static strums, falling notes, and hold bodies -
+//      is desaturated (HSV shader at saturation 0) and operates at 25%
+//      opacity... WHILE the player has notes on screen it fades to fully
+//      invisible (middle-scroll stacks both lane sets, so the ghost arrows
+//      would only add noise), and smoothly fades BACK to 25% when no player
+//      arrows are on screen.
+//
+//   { 'e': 'FunkyCompatAspect', 'v': { 'w': 960, 'h': 720 } }
+//
+// Notes are spawned lazily, so dim/desat are re-applied from onNoteIncoming
+// for every enemy note the moment it materializes. The visible/hidden state
+// is toggled from the player note lifecycle (incoming/hit/miss) and the
+// enemy side's ALPHA IS ENFORCED EVERY FRAME from onUpdate - a lerp toward
+// the current target. Tweens were order-dependent (a delayed re-pin could
+// fire after a hide, and note sprites hard-reset alpha to 1.0 on spawn
+// recycle), so some arrows slipped back to visible; the per-frame loop
+// converges regardless of spawn/hide ordering. FunkySprite is used because
+// the hscript runtime can only resolve makeSolidColor on the game's sprite
+// class. Bars/camera die with the PlayState. This class must live in the
+// LAYER mod's own scripts/ folder (a real mounted file) - scripted classes
+// cannot be injected via the asset cache.
+
+class FunkyCompatAspectSongEvent extends SongEvent
+{
+  static final ENEMY_BASE_ALPHA:Float = 0.25; // visible-state opacity
+  // Exponential per-second approach rate toward the current target: hiding
+  // is snappy, revealing is a little softer. Not tween durations - the
+  // frame loop uses these to lerp, so order of spawns/hides never matters.
+  static final SHOW_RATE:Float = 8;
+  static final HIDE_RATE:Float = 20;
+
+  var barsActive:Bool;
+  var leftBar:FunkinSprite;
+  var rightBar:FunkinSprite;
+  var barsCam:FlxCamera;
+  var desatShader:Dynamic;
+
+  // Player notes currently on screen (spawned, not yet hit/missed).
+  var playerNoteCount:Int;
+  // Whether the enemy side is currently at ENEMY_BASE_ALPHA (true) or hidden.
+  var enemyShown:Bool;
+
+  public function new()
+  {
+    super('FunkyCompatAspect');
+    this.barsActive = false;
+    this.leftBar = null;
+    this.rightBar = null;
+    this.barsCam = null;
+    this.desatShader = null;
+    this.playerNoteCount = 0;
+    this.enemyShown = true;
+  }
+
+  public function getTitle():String
+  {
+    return 'Aspect Ratio (funky-compat)';
+  }
+
+  public function getEventSchema():Dynamic
+  {
+    return [
+      {name: 'w', title: 'View Width', defaultValue: 960, type: 'int'},
+      {name: 'h', title: 'View Height', defaultValue: 720, type: 'int'}
+    ];
+  }
+
+  override function handleEvent(data:Dynamic):Void
+  {
+    if (data == null || data.value == null) return;
+    var w:Int = Std.int(data.value.w);
+    if (w <= 0) w = 960;
+    applyBars(w);
+  }
+
+  override function onSongEnd(event:Dynamic):Void
+  {
+    restoreBars();
+  }
+
+  override function onGameOver(event:Dynamic):Void
+  {
+    restoreBars();
+  }
+
+  override function onDestroy(event:Dynamic):Void
+  {
+    restoreBars();
+  }
+
+  override function onNoteIncoming(event:Dynamic):Void
+  {
+    if (!this.barsActive) return;
+    if (event == null) return;
+    var note:Dynamic = noteFromEvent(event);
+    if (note == null) return;
+
+    if (isEnemyNote(note))
+    {
+      // Enemy note just materialized: set its base state (dimmed + gray) at
+      // the CURRENT visibility. onUpdate enforces it every frame from here.
+      dimNoteAndHold(note);
+    }
+    else if (isPlayerNote(note))
+    {
+      // A player arrow is on screen now - hide the enemy side.
+      this.playerNoteCount++;
+      if (this.playerNoteCount == 1) setEnemyShown(false);
+    }
+  }
+
+  override function onNoteHit(event:Dynamic):Void
+  {
+    noteGone(event);
+  }
+
+  override function onNoteMiss(event:Dynamic):Void
+  {
+    noteGone(event);
+  }
+
+  function noteGone(event:Dynamic):Void
+  {
+    if (!this.barsActive) return;
+    if (event == null) return;
+    var note:Dynamic = noteFromEvent(event);
+    if (note == null) return;
+    if (!isPlayerNote(note)) return;
+    this.playerNoteCount--;
+    if (this.playerNoteCount <= 0)
+    {
+      this.playerNoteCount = 0;
+      setEnemyShown(true);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Enemy visibility
+  // ------------------------------------------------------------------
+
+  // Toggle the visibility STATE - the actual fading is done by the
+  // per-frame enforcement in onUpdate, which is immune to spawn order.
+  function setEnemyShown(show:Bool):Void
+  {
+    if (this.enemyShown == show) return;
+    this.enemyShown = show;
+  }
+
+  override function onUpdate(event:Dynamic):Void
+  {
+    // Enforce the current enemy visibility every frame: pull every enemy
+    // element (static strums, notes, hold trails) toward the target alpha
+    // with exponential smoothing. Note sprites get alpha = 1.0 forced back
+    // on every spawn recycle and this loop always wins, so no arrow can
+    // stay visible after a hide regardless of when it was created.
+    if (!this.barsActive) return;
+    if (PlayState.instance == null) return;
+    var opp:Dynamic = PlayState.instance.opponentStrumline;
+    if (opp == null) return;
+
+    var elapsed:Float = 1 / 60;
+    if (event != null && event.elapsed != null) elapsed = event.elapsed;
+    var rate:Float = this.enemyShown ? SHOW_RATE : HIDE_RATE;
+    var target:Float = currentTargetAlpha();
+    var f:Float = 1.0 - Math.exp(-rate * elapsed);
+
+    lerpGroupAlpha(opp.strumlineNotes, target, f);
+    lerpGroupAlpha(opp.notes, target, f);
+    lerpGroupAlpha(opp.holdNotes, target, f);
+  }
+
+  function lerpGroupAlpha(group:Dynamic, target:Float, f:Float):Void
+  {
+    if (group == null || group.members == null) return;
+    for (m in group.members)
+    {
+      if (m == null) continue;
+      m.alpha += (target - m.alpha) * f;
+      var hold:Dynamic = m.holdNoteSprite;
+      if (hold != null) hold.alpha += (target - hold.alpha) * f;
+    }
+  }
+
+  function currentTargetAlpha():Float
+  {
+    return this.enemyShown ? ENEMY_BASE_ALPHA : 0;
+  }
+
+  // ------------------------------------------------------------------
+  // Per-note setup (spawned lazily by the game)
+  // ------------------------------------------------------------------
+
+  // Set a newly-spawned enemy note's base state immediately (dimmed + gray)
+  // at the CURRENT visibility; onUpdate keeps enforcing from here on.
+  function dimNoteAndHold(note:Dynamic):Void
+  {
+    if (note == null) return;
+    note.alpha = currentTargetAlpha();
+    applyDesat(note);
+    var hold:Dynamic = note.holdNoteSprite;
+    if (hold != null)
+    {
+      hold.alpha = currentTargetAlpha();
+      applyDesat(hold);
+    }
+  }
+
+  function noteFromEvent(event:Dynamic):Dynamic
+  {
+    if (event.note != null) return event.note;
+    if (event.noteSprite != null) return event.noteSprite;
+    return null;
+  }
+
+  function isEnemyNote(note:Dynamic):Bool
+  {
+    return isNoteIn(note, PlayState.instance.opponentStrumline);
+  }
+
+  function isPlayerNote(note:Dynamic):Bool
+  {
+    return isNoteIn(note, PlayState.instance.playerStrumline);
+  }
+
+  function isNoteIn(note:Dynamic, strums:Dynamic):Bool
+  {
+    if (note == null) return false;
+    if (strums == null || strums.notes == null || strums.notes.members == null) return false;
+    return strums.notes.members.indexOf(note) != -1;
+  }
+
+  // Grayscale via a shared HSV shader built at saturation 0 (the constructor
+  // path is the only hscript-safe way to push its GLSL uniforms). FlxSprite
+  // .shader is a plain field in this fork, so assigning it from hscript is safe.
+  function applyDesat(sprite:Dynamic):Void
+  {
+    if (sprite == null) return;
+    if (this.desatShader == null)
+    {
+      try
+      {
+        this.desatShader = new HSVShader(1, 0, 1); // hue 1, saturation 0, value 1
+      }
+      catch (e:Dynamic)
+      {
+        this.desatShader = null;
+      }
+    }
+    if (this.desatShader == null) return;
+    sprite.shader = this.desatShader;
+  }
+
+  // ------------------------------------------------------------------
+  // Bars + middle scroll
+  // ------------------------------------------------------------------
+
+  function applyBars(w:Int):Void
+  {
+    if (this.barsActive) return;
+    if (PlayState.instance == null) return;
+    if (w <= 0 || w >= FlxG.width) return;
+    this.barsActive = true;
+    var ps:Dynamic = PlayState.instance;
+
+    var bw:Int = Std.int((FlxG.width - w) / 2);
+    if (bw <= 0)
+    {
+      this.barsActive = false;
+      return;
+    }
+
+    // Dedicated static camera, added last so it draws above the world and
+    // the HUD. camHUD bops with the music; this camera never moves. (The
+    // fork's FlxCamera defaults to an OPAQUE black background - bgColor = 0
+    // keeps it transparent, like the native mods' overlay cameras.)
+    if (this.barsCam == null)
+    {
+      this.barsCam = new FlxCamera(0, 0, FlxG.width, FlxG.height);
+      this.barsCam.bgColor = 0;
+      FlxG.cameras.add(this.barsCam, false);
+    }
+
+    if (this.leftBar == null)
+    {
+      this.leftBar = new FunkinSprite(0, 0).makeSolidColor(bw, FlxG.height, 0xFF000000);
+      this.leftBar.scrollFactor.set(0, 0);
+      this.leftBar.cameras = [this.barsCam];
+    }
+    if (this.rightBar == null)
+    {
+      this.rightBar = new FunkinSprite(FlxG.width - bw, 0).makeSolidColor(bw, FlxG.height, 0xFF000000);
+      this.rightBar.scrollFactor.set(0, 0);
+      this.rightBar.cameras = [this.barsCam];
+    }
+
+    ps.add(this.leftBar);
+    ps.add(this.rightBar);
+
+    // Middle scroll: center both strumlines' 4 lanes on the view center.
+    var spacing:Float = 112; // Strumline.NOTE_SPACING (104 + 8)
+    var size:Float = 104; // Strumline.STRUMLINE_SIZE
+    var centerX:Float = FlxG.width / 2 - (3 * spacing + size) / 2;
+    var playStrums:Dynamic = ps.playerStrumline;
+    if (playStrums != null) playStrums.x = centerX;
+    var oppStrums:Dynamic = ps.opponentStrumline;
+    if (oppStrums != null) oppStrums.x = centerX;
+
+    // Enemy side setup: group alpha floor + one-shot dim/desat on everything
+    // that already exists at t=0 (static arrows, pre-spawned notes, holds).
+    // Later spawns are handled by onNoteIncoming.
+    if (oppStrums != null)
+    {
+      oppStrums.alpha = ENEMY_BASE_ALPHA;
+      dimAll(oppStrums.strumlineNotes);
+      dimAll(oppStrums.notes);
+      dimAll(oppStrums.holdNotes);
+    }
+  }
+
+  function dimAll(group:Dynamic):Void
+  {
+    if (group == null || group.members == null) return;
+    for (m in group.members)
+    {
+      if (m == null) continue;
+      m.alpha = currentTargetAlpha();
+      applyDesat(m);
+      var hold:Dynamic = m.holdNoteSprite;
+      if (hold != null)
+      {
+        hold.alpha = currentTargetAlpha();
+        applyDesat(hold);
+      }
+    }
+  }
+
+  function restoreBars():Void
+  {
+    if (!this.barsActive) return;
+    this.barsActive = false;
+    this.playerNoteCount = 0;
+    this.enemyShown = true;
+    if (this.leftBar != null)
+    {
+      this.leftBar.destroy();
+      this.leftBar = null;
+    }
+    if (this.rightBar != null)
+    {
+      this.rightBar.destroy();
+      this.rightBar = null;
+    }
+    if (this.barsCam != null)
+    {
+      FlxG.cameras.remove(this.barsCam, false);
+      this.barsCam.destroy();
+      this.barsCam = null;
+    }
+  }
+}

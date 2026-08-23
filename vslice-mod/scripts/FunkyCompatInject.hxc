@@ -1,0 +1,260 @@
+// funky-compat - runtime injection.
+// Caches the converted virtual assets and wires the converted content into
+// the game's registries so it appears in Freeplay / Story Mode / gameplay.
+
+import funkin.Assets;
+import funkin.Paths;
+import funkin.data.song.SongRegistry;
+import funkin.data.story.level.LevelRegistry;
+import funkin.data.stage.StageRegistry;
+// The game aliases this legacy import path to the real parser class -
+// submodule imports (with double class names) do not resolve in scripts.
+import funkin.play.character.CharacterDataParser;
+import funkin.data.freeplay.player.PlayerRegistry;
+import funkin.util.ReflectUtil;
+import funkin.play.song.Song;
+import funkin.ui.story.Level;
+import funkin.play.stage.Stage;
+
+class FunkyCompatInject
+{
+  public var util:FunkyCompatUtil;
+
+  public function new(util:FunkyCompatUtil)
+  {
+    this.util = util;
+  }
+
+  // ------------------------------------------------------------------
+  // Generic virtual asset caching
+  // ------------------------------------------------------------------
+
+  public function cacheAll(out:Dynamic):Void
+  {
+    // Virtual text files (JSON, XML atlases...)
+    var texts:Array<Dynamic> = out.texts;
+    for (item in texts)
+    {
+      for (key in item.paths)
+      {
+        util.injectText(key, item.content);
+      }
+    }
+
+    // Virtual images (PNG) - lazy by path when the mod lives on disk.
+    var images:Array<Dynamic> = out.images;
+    for (item in images)
+    {
+      for (key in item.paths)
+      {
+        util.injectImage(key, item.bytes, item.file);
+      }
+    }
+
+    // Virtual audio (OGG/MP3) - lazy by path when the mod lives on disk.
+    var sounds:Array<Dynamic> = out.sounds;
+    for (item in sounds)
+    {
+      for (key in item.paths)
+      {
+        util.injectAudio(key, item.bytes, true, item.file);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Registry wiring
+  // ------------------------------------------------------------------
+
+  // Register a song entry. The Song constructor loads its metadata through
+  // the asset cache, exactly like a real mounted mod would.
+  public function injectSong(songId:String):Bool
+  {
+    if (SongRegistry.instance.entries.exists(songId)) return true;
+    var song:Song = null;
+    try
+    {
+      song = new Song(songId);
+    }
+    catch (e:Dynamic)
+    {
+      util.warn('Failed to construct Song($songId): $e');
+      return false;
+    }
+    if (song == null || song._data == null)
+    {
+      util.warn('Song $songId failed to load metadata (virtual=' + util.verifyVirtual('assets/data/songs/$songId/$songId-metadata.json') + ')');
+      return false;
+    }
+    SongRegistry.instance.entries.set(songId, song);
+    return true;
+  }
+
+  public function injectLevel(levelId:String):Bool
+  {
+    if (LevelRegistry.instance.entries.exists(levelId)) return true;
+    var level:Level = null;
+    try
+    {
+      level = new Level(levelId);
+    }
+    catch (e:Dynamic)
+    {
+      util.warn('Failed to construct Level($levelId): $e');
+      return false;
+    }
+    if (level == null || level._data == null)
+    {
+      util.warn('Level $levelId failed to load data');
+      return false;
+    }
+    LevelRegistry.instance.entries.set(levelId, level);
+    return true;
+  }
+
+  public function injectStage(stageId:String):Bool
+  {
+    if (StageRegistry.instance.entries.exists(stageId)) return true;
+    var stage:Stage = null;
+    try
+    {
+      stage = new Stage(stageId);
+    }
+    catch (e:Dynamic)
+    {
+      util.warn('Failed to construct Stage($stageId): $e');
+      return false;
+    }
+    if (stage == null || stage._data == null)
+    {
+      util.warn('Stage $stageId failed to load data');
+      return false;
+    }
+    // Defensive pass: addCharacter() reads these fields directly, and a
+    // missing one (e.g. an incomplete source stage data) crashes the game
+    // with a null reference. Normalize every character entry.
+    hardenStageCharacters(stage._data);
+    StageRegistry.instance.entries.set(stageId, stage);
+    return true;
+  }
+
+  // Ensure every stage character entry supplies the fields addCharacter reads
+  // (cameraOffsets, position, scale, zIndex, scroll, alpha, angle).
+  public function hardenStageCharacters(data:Dynamic):Void
+  {
+    if (data == null) return;
+    var chars:Dynamic = ReflectUtil.getField(data, 'characters');
+    if (chars == null) return;
+    var slots:Array<String> = ['bf', 'dad', 'gf'];
+    for (slot in slots)
+    {
+      var entry:Dynamic = ReflectUtil.getField(chars, slot);
+      if (entry == null) continue;
+      var camOff:Dynamic = ReflectUtil.getField(entry, 'cameraOffsets');
+      if (camOff == null || camOff.length < 2) ReflectUtil.setAnonymousField(entry, 'cameraOffsets', [0, 0]);
+      var pos:Dynamic = ReflectUtil.getField(entry, 'position');
+      if (pos == null || pos.length < 2) ReflectUtil.setAnonymousField(entry, 'position', [0, 0]);
+      if (ReflectUtil.getField(entry, 'scale') == null) ReflectUtil.setAnonymousField(entry, 'scale', 1);
+      if (ReflectUtil.getField(entry, 'zIndex') == null) ReflectUtil.setAnonymousField(entry, 'zIndex', 0);
+      var scroll:Dynamic = ReflectUtil.getField(entry, 'scroll');
+      if (scroll == null || scroll.length < 2) ReflectUtil.setAnonymousField(entry, 'scroll', [1, 1]);
+      if (ReflectUtil.getField(entry, 'alpha') == null) ReflectUtil.setAnonymousField(entry, 'alpha', 1);
+      if (ReflectUtil.getField(entry, 'angle') == null) ReflectUtil.setAnonymousField(entry, 'angle', 0);
+    }
+  }
+
+  // Register a character by parsing its virtual JSON through the game's own
+  // parser, then storing the result in the character cache.
+  public function injectCharacter(charId:String):Bool
+  {
+    if (CharacterDataParser.characterCache.exists(charId)) return true;
+    var data = null;
+    try
+    {
+      data = CharacterDataParser.parseCharacterData(charId);
+    }
+    catch (e:Dynamic)
+    {
+      util.warn('Failed to parse character $charId: $e');
+      return false;
+    }
+    if (data == null)
+    {
+      util.warn('Character $charId failed to validate');
+      return false;
+    }
+    CharacterDataParser.characterCache.set(charId, data);
+    return true;
+  }
+
+  // Add a character to the default player's owned characters so Freeplay
+  // allows selecting it.
+  public function grantOwnedCharacter(charId:String):Void
+  {
+    try
+    {
+      var player = PlayerRegistry.instance.entries.get('bf');
+      if (player == null) return;
+      if (player._data == null) return;
+      if (player._data.ownedChars == null) return;
+      if (player._data.ownedChars.indexOf(charId) == -1)
+      {
+        player._data.ownedChars.push(charId);
+      }
+    }
+    catch (e:Dynamic)
+    {
+      util.warn('Failed to grant owned character $charId: $e');
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Full pipeline for one converted mod
+  // ------------------------------------------------------------------
+
+  // out contains: texts, images, sounds, songs, levels, stages, chars, playerChars
+  public function injectMod(out:Dynamic):Void
+  {
+    if (out == null) return;
+
+    cacheAll(out);
+
+    // Blank title images for imported weeks.
+    var levels:Array<String> = out.levels;
+    for (levelId in levels)
+    {
+      util.cacheBlankTitle(levelId);
+    }
+
+    var stages:Array<String> = out.stages;
+    for (stageId in stages)
+    {
+      injectStage(stageId);
+    }
+
+    var chars:Array<String> = out.chars;
+    for (charId in chars)
+    {
+      injectCharacter(charId);
+    }
+
+    var songs:Array<String> = out.songs;
+    for (songId in songs)
+    {
+      injectSong(songId);
+    }
+
+    for (levelId in levels)
+    {
+      injectLevel(levelId);
+    }
+
+    var playerChars:Array<String> = out.playerChars;
+    for (charId in playerChars)
+    {
+      grantOwnedCharacter(charId);
+    }
+
+    trace('[FUNKY-COMPAT] Asset cache: ${util.lazyImages} lazy images, ${util.eagerImages} eager images, ${util.lazySounds} lazy sounds, ${util.eagerSounds} eager sounds.');
+  }
+}

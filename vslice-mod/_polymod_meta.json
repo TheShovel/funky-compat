@@ -1,0 +1,13 @@
+{
+  "id": "funkycompat.layer",
+  "title": "funky-compat",
+  "description": "Runtime compatibility layer: imports Psych Engine and Codename Engine mods into V-Slice (0.8.x) entirely in memory. Drop foreign mods into the mods folder alongside this mod - no conversion files are ever written, and the mods themselves are never modified.",
+  "contributors": [
+    {
+      "name": "funky-compat"
+    }
+  ],
+  "api_version": "0.8.4",
+  "mod_version": "0.2.0",
+  "license": "MIT"
+}

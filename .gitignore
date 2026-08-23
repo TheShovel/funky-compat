@@ -1,0 +1,21 @@
+# Reference engine sources (cloned for conversion work, not part of the mod)
+codename-src/
+psych-src/
+funkin-src/
+polymod-src/
+fndocs/
+
+# Debug/scratch images
+.preview_*.png
+.tmp_*.png
+
+# Dev tools (hardcoded paths, not part of the mod)
+tools/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
