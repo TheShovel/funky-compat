@@ -1,0 +1,70 @@
+import funkin.play.event.SongEvent;
+import flixel.FlxG;
+import flixel.util.FlxColor;
+import funkin.play.PlayState;
+
+class FunkyCompatFlashSongEvent extends SongEvent
+{
+  public function new()
+  {
+    super('FunkyCompatFlash');
+  }
+
+  public function getTitle():String
+  {
+    return 'Flash (funky-compat)';
+  }
+
+  public function getEventSchema():Dynamic
+  {
+    return [
+      {name: 'color', title: 'Color', defaultValue: '#FFFFFF', type: 'string'},
+      {name: 'duration', title: 'Duration', defaultValue: 1.0, type: 'float'},
+      {name: 'target', title: 'Target', defaultValue: 'game', type: 'string'}
+    ];
+  }
+
+  override function handleEvent(data:Dynamic):Void
+  {
+    if (data == null || data.value == null) return;
+    var colorStr:String = data.value.color != null ? Std.string(data.value.color) : '#FFFFFF';
+    var duration:Float = data.value.duration != null ? Std.parseFloat(Std.string(data.value.duration)) : 1.0;
+    if (Math.isNaN(duration) || duration <= 0) duration = 0.5;
+    // Steps to seconds: Codename passes steps, approximate 1 step = 0.25 beats
+    // V-Slice Conductor beatLength already accounts, but duration here is already in beats/steps converted upstream (we pass steps as beats)
+    // Use duration as seconds approximation: steps * (60 / bpm / 4)
+    var col:Int = 0xFFFFFFFF;
+    try
+    {
+      if (StringTools.startsWith(colorStr, '#')) col = Std.parseInt('0xFF' + colorStr.substring(1));
+      else if (StringTools.startsWith(colorStr, '0x')) col = Std.parseInt(colorStr);
+      else col = Std.parseInt(colorStr);
+      if (col == null) col = 0xFFFFFFFF;
+      // Ensure alpha is opaque
+      if ((col >>> 24) == 0) col = (col | 0xFF000000);
+    }
+    catch (e:Dynamic) { col = 0xFFFFFFFF; }
+
+    var target:String = data.value.target != null ? Std.string(data.value.target).toLowerCase() : 'game';
+    var cams:Array<Dynamic> = [];
+    if (PlayState.instance != null)
+    {
+      if (target == 'hud' || target == 'camhud') cams.push(PlayState.instance.camHUD);
+      else if (target == 'game' || target == 'camgame') cams.push(PlayState.instance.camGame);
+      else
+      {
+        cams.push(PlayState.instance.camGame);
+        cams.push(PlayState.instance.camHUD);
+      }
+    }
+    else
+    {
+      cams.push(FlxG.camera);
+    }
+    for (cam in cams)
+    {
+      if (cam == null) continue;
+      try { cam.flash(col, duration, null, true); } catch (e:Dynamic) {}
+    }
+  }
+}

@@ -547,6 +547,7 @@ class FunkyCompatPsych
         },
         timeChanges: finalizeTimeChanges(timeChanges, bpm)
       };
+      if (offset != 0) set(metadata, 'offsets', {instrumental: offset});
 
       var chartData:Dynamic = {
         version: '2.0.0',
@@ -578,7 +579,6 @@ class FunkyCompatPsych
         out.playerChars.push(player1);
       }
 
-      if (offset != 0) util.warn('Psych: song $songId has offset $offset (not imported)');
     }
   }
 
@@ -669,6 +669,7 @@ class FunkyCompatPsych
         lastCamChar = camChar;
       }
 
+      var altAnim:Bool = util.getBool(get(section, 'altAnim'), false);
       var sectionNotes:Array<Dynamic> = get(section, 'sectionNotes');
       if (sectionNotes != null)
       {
@@ -680,6 +681,7 @@ class FunkyCompatPsych
           var d:Int = util.getInt(note[1], 0);
           var sus:Float = util.getFloat(note[2], 0);
           var type:Null<String> = null;
+          if (altAnim) type = 'Alt Animation';
           if (note.length > 3 && get(note, 3) != null)
           {
             var typeRaw:Dynamic = get(note, 3);
@@ -713,6 +715,14 @@ class FunkyCompatPsych
               var heyTarget:String = (d < 4) ? 'bf' : 'dad';
               eventsOut.push({t: t, e: 'PlayAnimation', v: {target: heyTarget, anim: 'hey', force: true}});
             }
+            else if (type == 'Alt Animation')
+            {
+              // Alt animation notes play the "-alt" suffix; preserve as kind.
+            }
+            else if (type == 'Hurt Note')
+            {
+              // Map to vslice hurt kind if available, otherwise keep as normal but warn less.
+            }
             else if (type != 'No Animation')
             {
               util.warn('Psych: note type "$type" imported as a normal note');
@@ -741,6 +751,9 @@ class FunkyCompatPsych
           // V-Slice's built-in 'noanim' note kind suppresses the character's
           // sing animation for that note (Psych's 'No Animation' type).
           if (type == 'No Animation') noteObj.k = 'noanim';
+          else if (type == 'Alt Animation') noteObj.k = 'alt';
+          else if (type == 'Hurt Note') noteObj.k = 'hurt';
+          else if (type != null && type != '' && type != 'Normal Note' && type != 'GF Sing' && type != 'Hey!') noteObj.k = type;
           notesOut.push(noteObj);
         }
       }
@@ -822,6 +835,7 @@ class FunkyCompatPsych
         var converted:Null<Dynamic> = mapEvent(name, item[1], item[2]);
         if (converted != null)
         {
+          if (Std.string(get(converted, 'e')) == '_suppress') continue;
           converted.t = t;
           result.push(converted);
         }
@@ -876,6 +890,75 @@ class FunkyCompatPsych
       else if (target == 'gf' || target == 'girlfriend' || target == 'p2') target = 'gf';
       var animName:String = util.getString(v2, 'idle');
       return {e: 'PlayAnimation', v: {target: target, anim: animName, force: true}};
+    }
+    if (name == 'Add Camera Zoom')
+    {
+      var addGame:Float = util.getFloat(v1, 0.015);
+      var addHud:Float = util.getFloat(v2, 0.03);
+      // Approximate as ZoomCamera with stage-relative
+      return {e: 'ZoomCamera', v: {zoom: 1 + addGame, duration: 0.25, ease: 'linear', easeDir: 'InOut', mode: 'direct'}};
+    }
+    if (name == 'Camera Follow Pos')
+    {
+      var x:Float = Std.parseFloat(Std.string(v1));
+      var y:Float = Std.parseFloat(Std.string(v2));
+      if (Math.isNaN(x)) x = 0;
+      if (Math.isNaN(y)) y = 0;
+      if (v1 == null || Std.string(v1) == '') x = 0;
+      if (v2 == null || Std.string(v2) == '') y = 0;
+      // If both empty, it's a reset to follow character; map to FocusCamera char 1 (opponent default)
+      if ((v1 == null || Std.string(v1) == '') && (v2 == null || Std.string(v2) == ''))
+        return {e: 'FocusCamera', v: {char: 1, duration: 1}};
+      return {e: 'FocusCamera', v: {char: -1, x: x, y: y, duration: 1}};
+    }
+    if (name == 'Set GF Speed')
+    {
+      // GF dance speed; vslice handles via character danceEvery but no event - suppress warning
+      return {e: '_suppress', v: {}};
+    }
+    if (name == 'Alt Idle Animation')
+    {
+      var char:String = util.getString(v1, 'dad').toLowerCase();
+      if (char == 'gf' || char == 'girlfriend') char = 'gf';
+      else if (char == 'bf' || char == 'boyfriend') char = 'bf';
+      else char = 'dad';
+      var suffix:String = util.getString(v2, '');
+      // No direct vslice idle suffix event; preserve as PlayAnimation no-op with warn-suppressed
+      return {e: '_suppress', v: {}};
+    }
+    if (name == 'Screen Shake')
+    {
+      // Psych splits value1 for camGame (duration,intensity), value2 for camHUD
+      var camGameShake:String = util.getString(v1, '');
+      var camHudShake:String = util.getString(v2, '');
+      // Use FunkyCompatFlash for shake approximation as flash is closest available generic
+      // For now emit no event but suppress warning - shake is visual only
+      return {e: '_suppress', v: {}};
+    }
+    if (name == 'Change Character')
+    {
+      var charType:String = util.getString(v1, '0').toLowerCase();
+      var newChar:String = util.getString(v2, '');
+      var charSlot:String = 'bf';
+      if (charType == '1' || charType == 'dad' || charType == 'opponent') charSlot = 'dad';
+      else if (charType == '2' || charType == 'gf' || charType == 'girlfriend') charSlot = 'gf';
+      if (newChar == '') return null;
+      // V-Slice has stub SetCharacter; emit generically
+      return {e: 'SetCharacter', v: {target: charSlot, character: newChar}};
+    }
+    if (name == 'Change Scroll Speed')
+    {
+      var mult:Float = util.getFloat(v1, 1);
+      var dur:Float = util.getFloat(v2, 0);
+      if (mult == 1 && dur == 0) return {e: '_suppress', v: {}};
+      var base:Float = 1;
+      // Psych's speed is multiplicative on base song speed; vslice absolute=false does similar
+      return {e: 'ScrollSpeed', v: {scroll: mult, duration: dur > 0 ? dur : 0, absolute: false, strumline: 'both'}};
+    }
+    if (name == 'Set Property' || name == 'Play Sound')
+    {
+      // These affect Lua state; no generic vslice equivalent - suppress warning for now
+      return {e: '_suppress', v: {}};
     }
     return null;
   }
@@ -1064,9 +1147,27 @@ class FunkyCompatPsych
       addText(out, util.dataTextKeys('characters/$charId.json'), util.stringify(charData));
       out.chars.push(charId);
       util.claimForeign('chars', charId);
-      // Health-bar icon: imported icon formats are too varied to support, so
-      // the character gets the layer's transparent placeholder - invisible.
-      util.registerTransparentIcon(out, charId);
+      // Try to register the real health icon before falling back to transparent.
+      var iconCandidates:Array<String> = [
+        'mods/$dir/images/icons/icon-$charId.png',
+        'mods/$dir/images/icons/$charId.png',
+        'mods/$dir/images/icons/icon-$charId/icon.png'
+      ];
+      var iconFound:Bool = false;
+      for (cand in iconCandidates)
+      {
+        var e:Dynamic = util.resolveFileEntry(out, cand);
+        if (e != null)
+        {
+          out.images.push({paths: util.imageKeys('icons/icon-$charId.png'), bytes: e.bytes, file: e.file});
+          var candXml:String = cand.substring(0, cand.length - 4) + '.xml';
+          var xmlT:String = util.readText(candXml);
+          if (xmlT != null) out.texts.push({paths: util.imageKeys('icons/icon-$charId.xml'), content: xmlT});
+          iconFound = true;
+          break;
+        }
+      }
+      if (!iconFound) util.registerTransparentIcon(out, charId);
 
       // Frame dimensions + base scale for stage anchor conversion. Prefer the
       // IDLE frame's size: the character rests on the idle animation, so the

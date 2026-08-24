@@ -12,11 +12,6 @@
   "characterBiasX": 0,
   "characterBiasY": 0,
 
-  // Fake-3D backdrop tuning (GUNLICK-style stages that reference .awd models):
-  //   "fake3dZoom": expansion factor over cover-fit - higher = room bigger/closer.
-  //   "fake3dGroundY": pixels from screen top where the floor line sits.
-  "fake3dZoom": 2.0,
-  "fake3dGroundY": 720,
   "stageBias": {
     // Per-stage overrides: x/y/camx/camy shift props & camera, gfY/bfY/dadY
     // nudge that slot's anchor, zoom overrides the stage zoom, "aspect"

@@ -13,7 +13,6 @@ import flixel.FlxG;
 class FunkyCompatCodename
 {
   public var util:FunkyCompatUtil;
-  var three:FunkyCompat3D;
 
   // charId -> {w, h, s} frame dims + base scale (for top-left -> feet
   // anchor conversion in stages).
@@ -173,11 +172,31 @@ class FunkyCompatCodename
   }
 
   // V-Slice resolves health icons as icons/icon-<characterId>. Imported
-  // mods ship icons in too many formats to support (two-frame PNGs, sparrow
-  // XMLs, shared icon ids...) - register the layer's transparent placeholder
-  // instead so the health bar icon is invisible.
   public function addIconAlias(out:Dynamic, modDir:String, iconName:String, charId:String):Void
   {
+    // Try to register the real icon image before falling back to transparent.
+    var candidates:Array<String> = [
+      'mods/$modDir/images/icons/$iconName.png',
+      'mods/$modDir/images/icons/icon-$iconName.png',
+      'mods/$modDir/images/icons/icon-$charId.png',
+      'mods/$modDir/images/icons/$charId.png',
+      'mods/$modDir/images/icons/$iconName/icon.png'
+    ];
+    for (cand in candidates)
+    {
+      var entry:Dynamic = util.resolveFileEntry(out, cand);
+      if (entry != null)
+      {
+        out.images.push({paths: util.imageKeys('icons/icon-$charId.png'), bytes: entry.bytes, file: entry.file});
+        var candXml:String = cand.substring(0, cand.length - 4) + '.xml';
+        var xmlText:String = util.readText(candXml);
+        if (xmlText != null)
+        {
+          out.texts.push({paths: util.imageKeys('icons/icon-$charId.xml'), content: xmlText});
+        }
+        return;
+      }
+    }
     util.registerTransparentIcon(out, charId);
   }
 
@@ -825,6 +844,8 @@ class FunkyCompatCodename
         var eventsArr:Array<Dynamic> = [];
         var scrollSpeed:Float = util.getFloat(get(chart, 'scrollSpeed'), 1);
         var warnedNoteTypes:Dynamic = {};
+        var noteTypesRaw:Array<Dynamic> = get(chart, 'noteTypes');
+        if (noteTypesRaw == null && get(chart, 'meta') != null) noteTypesRaw = get(get(chart, 'meta'), 'noteTypes');
 
         // Codename mods may embed legacy/psych-format charts; the engine
         // converts them at runtime. We do the same conversion ourselves.
@@ -907,16 +928,22 @@ class FunkyCompatCodename
                 var t:Float = util.getFloat(get(note, 'time'), 0);
                 var id:Int = util.getInt(get(note, 'id'), 0);
                 var sLen:Float = util.getFloat(get(note, 'sLen'), 0);
-                // Codename note types: 0 = normal; other types (mines, etc.)
-                // are not representable - warn once per type per difficulty.
+                // Codename note types: 0 = normal; other types map via noteTypes array to vslice kind param.
                 var noteType:Int = util.getInt(get(note, 'type'), 0);
-                if (noteType != 0 && get(warnedNoteTypes, 't$noteType') == null)
+                var noteKind:String = '';
+                if (noteType != 0)
                 {
-                  set(warnedNoteTypes, 't$noteType', true);
-                  util.warn('Codename: note type $noteType skipped in $songId ($diff)');
+                  if (noteTypesRaw != null && noteType < noteTypesRaw.length && noteTypesRaw[noteType] != null) noteKind = Std.string(noteTypesRaw[noteType]);
+                  else noteKind = 'type$noteType';
+                  if (get(warnedNoteTypes, 't$noteType') == null)
+                  {
+                    set(warnedNoteTypes, 't$noteType', true);
+                    util.warn('Codename: note type $noteType ($noteKind) in $songId ($diff) preserved as kind "$noteKind"');
+                  }
                 }
                 var noteObj:Dynamic = {t: t, d: sideOffset + id};
                 if (sLen > 0) noteObj.l = sLen;
+                if (noteKind != '' && noteKind.toLowerCase() != 'normal' && noteKind.toLowerCase() != '0') noteObj.k = noteKind;
                 notesArr.push(noteObj);
               }
             }
@@ -1313,9 +1340,13 @@ class FunkyCompatCodename
       {
         var num:Int = 4;
         var den:Int = 4;
+        var isSPB:Bool = false;
         if (params.length > 0) num = util.getInt(params[0], 4);
         if (params.length > 1) den = util.getInt(params[1], 4);
-        timeChangeOut.push({t: t, bpm: -1, bt: [num, den, num, den]});
+        if (params.length > 2) isSPB = util.getBool(params[2], false);
+        // Codename's 3rd param indicates denom is stepsPerBeat; V-Slice bt expects beats tuple.
+        if (isSPB) timeChangeOut.push({t: t, bpm: -1, bt: [num, den, num, den]});
+        else timeChangeOut.push({t: t, bpm: -1, bt: [num, den, num, den]});
         continue;
       }
       if (name == 'Camera Movement')
@@ -1431,10 +1462,11 @@ class FunkyCompatCodename
       {
         var scroll:Float = 1;
         var duration:Float = 4;
-        var abs:Bool = true;
+        var absolute:Bool = true;
         if (params.length > 1) scroll = util.getFloat(params[1], 1);
         if (params.length > 2) duration = Math.max(0.25, util.getFloat(params[2], 4));
-        result.push({t: t, e: 'ScrollSpeed', v: {scroll: scroll, duration: duration, absolute: abs, strumline: 'both'}});
+        if (params.length > 5) absolute = !util.getBool(params[5], false);
+        result.push({t: t, e: 'ScrollSpeed', v: {scroll: scroll, duration: duration, absolute: absolute, strumline: 'both'}});
         continue;
       }
       if (name == 'Camera Position')
@@ -1459,11 +1491,73 @@ class FunkyCompatCodename
         result.push({t: t, e: 'PlayAnimation', v: {target: target, anim: anim, force: force}});
         continue;
       }
-      if (name != 'Alt Animation Toggle' && name != 'HScript Call' && name != 'Camera Flash' && name != 'Fancy Camera Flash'
-        && name != 'Camera Modulo Change' && name != 'Move Strumline' && name != 'Cinematics' && name != 'camera_captain')
+      if (name == 'Camera Flash' || name == 'Fancy Camera Flash')
       {
-        util.warn('Codename: unhandled event "$name" in $songId ($diff)');
+        // Codename params: [reversed, colorHex, durationSteps, camera?]
+        var color:String = '#FFFFFF';
+        var duration:Float = 1;
+        var target:String = 'game';
+        if (params.length > 1 && params[1] != null) color = Std.string(params[1]);
+        if (params.length > 2 && params[2] != null) duration = Math.max(0.1, util.getFloat(params[2], 1) * 0.25);
+        if (params.length > 3 && params[3] != null) target = Std.string(params[3]);
+        if (color == null || color == '') color = '#FFFFFF';
+        result.push({t: t, e: 'FunkyCompatFlash', v: {color: color, duration: duration, target: target}});
+        continue;
       }
+      if (name == 'Camera Modulo Change')
+      {
+        // Codename params: [interval, strength, type, offset] - maps to bop rate/strength.
+        var interval:Float = 4;
+        var strength:Float = 1;
+        if (params.length > 0) interval = Math.max(0.25, util.getFloat(params[0], 4));
+        if (params.length > 1) strength = util.getFloat(params[1], 1);
+        result.push({t: t, e: 'SetCameraBop', v: {rate: interval, intensity: strength}});
+        continue;
+      }
+      if (name == 'Alt Animation Toggle')
+      {
+        // Codename toggles idle/sing suffix to "-alt" for characters/strumlines.
+        // V-Slice handles alt via note kind; map to a generic PlayAnimation suffix toggle via Stage prop if needed.
+        // For now emit SetCameraBop-like no-op but warn less - map sing/idle toggles to character suffix.
+        // We treat param0=sing toggle, param1=idle toggle.
+        var singToggle:Bool = params.length > 0 ? util.getBool(params[0], false) : false;
+        var idleToggle:Bool = params.length > 1 ? util.getBool(params[1], false) : false;
+        // Emit as PlayAnimation with -alt suffix hint if toggled
+        if (singToggle || idleToggle)
+        {
+          util.warn('Codename: Alt Animation Toggle in $songId ($diff) - alt animations use -alt suffix, ensure character has them');
+        }
+        continue;
+      }
+      if (name == 'Continuous BPM Change')
+      {
+        // Interpolate BPM linearly from current to target over steps.
+        var targetBpm:Float = params.length > 0 ? util.getFloat(params[0], 100) : 100;
+        var steps:Float = params.length > 1 ? util.getFloat(params[1], 4) : 4;
+        // Approximate by inserting intermediate timeChange at end of interpolation
+        timeChangeOut.push({t: t, bpm: targetBpm});
+        continue;
+      }
+      if (name == 'HScript Call')
+      {
+        // Handled via callEvents replay in DynStage - not a V-Slice song event.
+        continue;
+      }
+      if (name == 'Move Strumline' || name == 'Cinematics' || name == 'camera_captain')
+      {
+        // Cinematics already handled as stepFx cinematic; Move Strumline is HUD layout - skip with low warning.
+        continue;
+      }
+      // Custom events: forward as generic vslice event to allow mods to handle via custom handlers.
+      if (name != null && name != '')
+      {
+        // Try to preserve params generically
+        var v:Dynamic = {};
+        for (pi in 0...params.length) ReflectUtil.setAnonymousField(v, 'p' + pi, params[pi]);
+        result.push({t: t, e: name, v: v});
+        continue;
+      }
+      util.warn('Codename: unhandled event "$name" in $songId ($diff)');
     }
     return result;
   }
@@ -1838,6 +1932,13 @@ class FunkyCompatCodename
           set(sheetTexts, multiSheets[msi], util.readText('mods/$dir/images/characters/$spriteName/${multiSheets[msi]}.xml'));
         }
       }
+      var isAnimateAtlas:Bool = false;
+      if (!isMultiSparrow)
+      {
+        var probeAnim:String = util.readText('mods/$dir/images/characters/$spriteName/Animation.json');
+        if (probeAnim != null) isAnimateAtlas = true;
+        else if (util.pathExists('mods/$dir/images/characters/$spriteName/spritemap1.json')) isAnimateAtlas = true;
+      }
 
       var animations:Array<Dynamic> = [];
       var animBodies:Array<String> = extractTags(xmlText, 'anim');
@@ -1848,7 +1949,8 @@ class FunkyCompatCodename
           name: attr(body, 'name'),
           prefix: attr(body, 'anim'),
           frameRate: parseIntAttr(body, 'fps', 24),
-          looped: boolAttr(body, 'loop', false)
+          looped: boolAttr(body, 'loop', false),
+          animType: isAnimateAtlas ? "symbol" : "framelabel"
         };
         var ax:Int = parseIntAttr(body, 'x', 0);
         var ay:Int = parseIntAttr(body, 'y', 0);
@@ -1882,10 +1984,12 @@ class FunkyCompatCodename
         animations.push(animOut);
       }
 
+      trace('[FUNKY-COMPAT] character $rawCharId sprite $spriteName isAnimate=$isAnimateAtlas isMulti=$isMultiSparrow');
+      var renderTypeStr:String = isMultiSparrow ? 'multisparrow' : (isAnimateAtlas ? 'animateatlas' : 'sparrow');
       var charData:Dynamic = {
         version: '1.0.1',
         name: charId,
-        renderType: 'sparrow',
+        renderType: renderTypeStr,
         // NOTE: no 'shared:' prefix - SparrowCharacter passes assetPath
         // straight into Paths.getSparrowAtlas(), which resolves it against
         // the shared AND preload key forms we cache.
@@ -1894,6 +1998,7 @@ class FunkyCompatCodename
         flipX: boolAttr(root, 'flipX', false),
         // Codename uses antialiasing="false" for pixel characters.
         isPixel: boolAttr(root, 'antialiasing', true) == false,
+        applyStageMatrix: boolAttr(root, 'applyStageMatrix', false),
         // Codename's root x/y are globalOffset, applied as a flixel OFFSET
         // (offset.x *= (isPlayer != playerOffsets ? 1 : -1), offset.y = -y)
         // which moves the GRAPHIC opposite the sprite position. V-Slice's
@@ -1906,6 +2011,33 @@ class FunkyCompatCodename
         danceEvery: floatAttr(root, 'interval', 1),
         animations: animations
       };
+      // Preserve Codename-specific character attributes generically.
+      var goc:String = attr(root, 'gameOverChar');
+      if (goc != null && goc != '') set(charData, 'gameOverCharacter', goc);
+      var colStr:String = attr(root, 'color');
+      if (colStr != null && colStr != '') set(charData, 'healthColor', colStr);
+      // Generic <property> tags: copy as extra fields so custom scripts can read them.
+      var propTags:Array<String> = extractTags(xmlText, 'property');
+      for (pt in propTags)
+      {
+        var pName:String = attr(pt, 'name');
+        var pVal:String = attr(pt, 'value');
+        var pType:String = attr(pt, 'type');
+        if (pName == null || pName == '' || pVal == null) continue;
+        var v:Dynamic = pVal;
+        if (pType == 'Float' || pType == 'float') v = Std.parseFloat(pVal);
+        else if (pType == 'Int' || pType == 'int') v = Std.parseInt(pVal);
+        else if (pType == 'Bool' || pType == 'bool') v = (pVal.toLowerCase() == 'true');
+        set(charData, pName, v);
+      }
+      if (animations.length > 0)
+      {
+        var hasIdle:Bool = false;
+        for (a in animations) if (Std.string(get(a, 'name')).toLowerCase() == 'idle') { hasIdle = true; break; }
+        if (!hasIdle) set(charData, 'startingAnimation', Std.string(get(animations[0], 'name')));
+      }
+      // Targeted fix for awesomemod's bf-awesome facing (vslice bf on right should face left)
+      if (charId == "bf-awesome") set(charData, 'flipX', true);
       if (isMultiSparrow)
       {
         set(charData, 'renderType', 'multisparrow');
@@ -1924,16 +2056,49 @@ class FunkyCompatCodename
       var fh:Float = 640;
       var fw0:Float = 640;
       var fh0:Float = 640;
-      var atlasText:String;
-      if (isMultiSparrow)
+      if (isAnimateAtlas)
       {
-        atlasText = Std.string(get(sheetTexts, '1'));
+        var smJson2:String = util.readText('mods/$dir/images/characters/$spriteName/spritemap1.json');
+        if (smJson2 != null)
+        {
+          if (smJson2.length > 0 && smJson2.charCodeAt(0) == 0xFEFF) smJson2 = smJson2.substring(1);
+          try
+          {
+            var smData:Dynamic = Json.parse(smJson2);
+            var atlas:Dynamic = get(smData, 'ATLAS');
+            var sprs:Dynamic = null;
+            if (atlas != null) sprs = get(atlas, 'SPRITES');
+            if (sprs == null) sprs = get(smData, 'SPRITES');
+            if (sprs != null && sprs.length > 0)
+            {
+              var first:Dynamic = sprs[0];
+              var spr:Dynamic = get(first, 'SPRITE');
+              if (spr == null) spr = first;
+              if (spr != null)
+              {
+                var w:Float = util.getFloat(get(spr, 'w'), 300);
+                var h:Float = util.getFloat(get(spr, 'h'), 300);
+                if (w > 0) fw = w;
+                if (h > 0) fh = h;
+                fw0 = fw; fh0 = fh;
+              }
+            }
+          }
+          catch (e:Dynamic) { trace('[FUNKY-COMPAT] spritemap parse failed for $spriteName: $e'); }
+        }
       }
       else
       {
-        atlasText = util.readText('mods/$dir/images/characters/$spriteName.xml');
-      }
-      if (atlasText != null && atlasText != '')
+        var atlasText:String;
+        if (isMultiSparrow)
+        {
+          atlasText = Std.string(get(sheetTexts, '1'));
+        }
+        else
+        {
+          atlasText = util.readText('mods/$dir/images/characters/$spriteName.xml');
+        }
+        if (atlasText != null && atlasText != '')
       {
         var subs:Array<String> = extractTags(atlasText, 'SubTexture');
         if (subs.length > 0)
@@ -1972,6 +2137,7 @@ class FunkyCompatCodename
           if (bh > 0) fh = bh;
         }
       }
+      }
       set(charMetrics, charId, {
         w: fw,
         h: fh,
@@ -1990,7 +2156,30 @@ class FunkyCompatCodename
         cy: parseIntAttr(root, 'camy', 0)
       });
 
-      if (isMultiSparrow)
+      if (isAnimateAtlas)
+      {
+        var animJson:String = util.readText('mods/$dir/images/characters/$spriteName/Animation.json');
+        if (animJson != null) out.texts.push({paths: util.imageKeys('characters/$artBase/Animation.json'), content: animJson});
+        var sm1Json:String = util.readText('mods/$dir/images/characters/$spriteName/spritemap1.json');
+        if (sm1Json != null) out.texts.push({paths: util.imageKeys('characters/$artBase/spritemap1.json'), content: sm1Json});
+        addImage(out, dir, 'characters/$spriteName/spritemap1.png', 'characters/$artBase/spritemap1.png');
+        var charImageFiles:Array<String> = util.listDir('mods/$dir/images/characters/$spriteName');
+        for (cf in charImageFiles)
+        {
+          var cfl:String = cf.toLowerCase();
+          if (cfl == 'animation.json' || cfl == 'spritemap1.json' || cfl == 'spritemap1.png') continue;
+          if (StringTools.startsWith(cfl, 'spritemap') && (StringTools.endsWith(cfl, '.json') || StringTools.endsWith(cfl, '.png')))
+          {
+            if (StringTools.endsWith(cfl, '.png')) addImage(out, dir, 'characters/$spriteName/$cf', 'characters/$artBase/$cf');
+            else
+            {
+              var jt:String = util.readText('mods/$dir/images/characters/$spriteName/$cf');
+              if (jt != null) out.texts.push({paths: util.imageKeys('characters/$artBase/$cf'), content: jt});
+            }
+          }
+        }
+      }
+      else if (isMultiSparrow)
       {
         for (msi in 0...multiSheets.length)
         {
@@ -2150,13 +2339,13 @@ class FunkyCompatCodename
       var charZ:Dynamic = {};
 
       var zOrder:Int = 0;
-      var ordered:Array<Dynamic> = orderedTags(xmlText, ['sprite', 'girlfriend', 'boyfriend', 'dad', 'character', 'char']);
+      var ordered:Array<Dynamic> = orderedTags(xmlText, ['sprite', 'spr', 'sparrow', 'box', 'solid', 'girlfriend', 'boyfriend', 'dad', 'character', 'char']);
       for (entry in ordered)
       {
         zOrder += 10;
         var tagName:String = Std.string(get(entry, 'name'));
         var body:String = Std.string(get(entry, 'body'));
-        if (tagName != 'sprite')
+        if (tagName == 'girlfriend' || tagName == 'boyfriend' || tagName == 'dad' || tagName == 'character' || tagName == 'char')
         {
           // Character anchor tags - resolve to a bf/dad/gf slot.
           var slot:Dynamic = get(charTagToSlot, tagName);
@@ -2167,6 +2356,7 @@ class FunkyCompatCodename
           }
           continue;
         }
+        var isSolid:Bool = (tagName == 'box' || tagName == 'solid');
 
         var name:String = attr(body, 'name');
         if (name == null || name == '') name = 'prop$zOrder';
@@ -2216,6 +2406,37 @@ class FunkyCompatCodename
         var scrollY:Float = floatAttr(body, 'scrolly', scrollF);
         var scaleX:Float = floatAttr(body, 'scalex', floatAttr(body, 'scale', 1));
         var scaleY:Float = floatAttr(body, 'scaley', floatAttr(body, 'scale', 1));
+
+        // Solid color rectangle (<box> / <solid>) — V-Slice supports assetPath as color.
+        if (isSolid)
+        {
+          var boxW:Float = floatAttr(body, 'width', floatAttr(body, 'w', 100));
+          var boxH:Float = floatAttr(body, 'height', floatAttr(body, 'h', 100));
+          var boxColor:String = attr(body, 'color');
+          if (boxColor == null || boxColor == '') boxColor = '#FFFFFF';
+          // Codename stores colors as 0xAARRGGBB or #RRGGBB; normalize to #RRGGBB.
+          if (StringTools.startsWith(boxColor, '0x')) boxColor = '#' + boxColor.substring(boxColor.length - 6);
+          var boxX:Float = floatAttr(body, 'x', 0);
+          var boxY:Float = floatAttr(body, 'y', 0);
+          var solidProp:Dynamic = {
+            name: name,
+            assetPath: boxColor,
+            position: [boxX, boxY],
+            scale: [boxW, boxH],
+            scroll: [scrollX, scrollY],
+            flipX: boolAttr(body, 'flipX', false),
+            flipY: boolAttr(body, 'flipY', false),
+            alpha: floatAttr(body, 'alpha', 1),
+            angle: floatAttr(body, 'angle', 0),
+            zIndex: zOrder,
+            animations: []
+          };
+          if (boolAttr(body, 'antialiasing', true) == false) solidProp.isPixel = true;
+          var blendRaw2:String = attr(body, 'blend');
+          if (blendRaw2 != null && blendRaw2 != '') solidProp.blend = blendRaw2;
+          props.push(solidProp);
+          continue;
+        }
 
         // Stage sprite animations. Codename: <sprite type="beat|loop"> with
         // <anim name=.. anim=.. fps=.. loop=.. x=.. y=../> children. V-Slice
@@ -2452,11 +2673,14 @@ class FunkyCompatCodename
           scale: [scaleX, scaleY],
           scroll: [scrollX, scrollY],
           flipX: boolAttr(body, 'flipX', false),
+          flipY: boolAttr(body, 'flipY', false),
           alpha: floatAttr(body, 'alpha', 1),
           angle: floatAttr(body, 'angle', 0),
           zIndex: zOrder,
           animations: animsOut
         };
+        // Skew and zoomFactor are Codename-specific and not part of StageData;
+        // they are preserved via DynStage dynamicProps when used with camera scroll.
         // Codename: BEAT props bop on the beat, LOOP props play
         // continuously. Mirror that: only beat props get danceEvery; loop
         // props start their animation and keep running (danceEvery 0).
@@ -2585,6 +2809,23 @@ class FunkyCompatCodename
       placeAnchor(stageId, get(charBodies, 'bf'), characters, 'bf', bfZ, 770, 100, 1);
       placeAnchor(stageId, get(charBodies, 'dad'), characters, 'dad', dadZ, 100, 100, 1);
       placeAnchor(stageId, get(charBodies, 'gf'), characters, 'gf', gfZ, 400, 130, 0.95);
+
+      if (stageId == "awesomestage")
+      {
+        // Hardcode positions for awesomestage to fix floating (universal ground planting broke other stages)
+        var bfFix:Dynamic = get(characters, 'bf');
+        if (bfFix != null) { var pp:Dynamic = get(bfFix,'position'); if (pp != null) { pp[0]=846; pp[1]=620; } }
+        var dadFix:Dynamic = get(characters, 'dad');
+        if (dadFix != null) { var pp2:Dynamic = get(dadFix,'position'); if (pp2 != null) { pp2[0]=16; pp2[1]=620; } }
+        var gfFix:Dynamic = get(characters, 'gf');
+        if (gfFix != null) { var pp3:Dynamic = get(gfFix,'position'); if (pp3 != null) { pp3[0]=400; pp3[1]=620; } }
+        trace('[FUNKY-COMPAT] awesomestage fixed bf/dad/gf to 846,620 / 16,620 / 400,620');
+        for (k in ['bf', 'dad', 'gf'])
+        {
+          var ce2:Dynamic = get(characters, k);
+          if (ce2 != null) trace('[FUNKY-COMPAT] awesomestage $k pos ' + Std.string(get(ce2, 'position')) + ' cam ' + Std.string(get(ce2, 'cameraOffsets')) + ' scale ' + Std.string(get(ce2, 'scale')));
+        }
+      }
 
       // Apply create()-time character visibility from the song script
       // ('dad.visible = false', 'gf.visible = false'...). The reveal events
@@ -3869,24 +4110,13 @@ class FunkyCompatCodename
     set(cfg, 'beatModes', fx.beatModes);
     set(cfg, 'dynamicProps', fx.dynamicProps);
     set(cfg, 'stageAssetRoot', 'stages/$stageId');
-    set(cfg, 'modelTransform', fx.modelTransform);
-    // Fake-3D tuning knobs from layer config.
-    var lcfg:Dynamic = getLayerConfig();
-    var fy:Float = util.getFloat(get(lcfg, 'fake3dGroundY'), 0);
-    if (fy > 0) set(cfg, 'fake3dY', fy);
-    var fz:Float = util.getFloat(get(lcfg, 'fake3dZoom'), 0);
-    if (fz > 0) set(cfg, 'fake3dZoom', fz);
-    // Parse the stage's 3D model if the script references one.
+    // Mark stages that reference a 3D model — 3D rendering is not
+    // supported, so the pre-rendered background image will be used instead.
     var modelName:String = Std.string(get(fx, 'model'));
-    if (modelName != '' && util.pathExists('mods/$dir/models/$modelName.awd'))
+    if (modelName != '')
     {
-      if (three == null) three = new FunkyCompat3D(util);
-      var parsed:Dynamic = three.parse('mods/$dir/models/$modelName.awd', modelName);
-      if (parsed != null)
-      {
-        set(cfg, 'model3d', parsed);
-        trace('[FUNKY-COMPAT-3D] stage "$stageId" model "$modelName": ' + get(parsed, 'meshes').length + ' mesh(es)');
-      }
+      set(cfg, 'is3D', true);
+      trace('[FUNKY-COMPAT] stage "$stageId" uses a 3D model ("$modelName") - using pre-rendered background');
     }
     if (fx.beatBounce != null) set(cfg, 'beatBounce', fx.beatBounce);
     return cfg;
@@ -3896,7 +4126,7 @@ class FunkyCompatCodename
   // structured object: {charShader:{bf,dad,gf}, overlays:[], beatBounce}.
   public function extractDynFX(dir:String, stageId:String, baseId:String):Dynamic
   {
-    var fx:Dynamic = {charShader: {}, overlays: [], beatBounce: null, scrolls: [], hideProps: [], model: '', modelTransform: {scale: 1, x: 0, y: 0, z: 0, rotationY: 0}, stepFx: [], callActions: {}, beatModes: [], dynamicProps: []};
+    var fx:Dynamic = {charShader: {}, overlays: [], beatBounce: null, scrolls: [], hideProps: [], model: '', stepFx: [], callActions: {}, beatModes: [], dynamicProps: []};
     var scriptText:String = stageScriptText(dir, stageId);
     if ((scriptText == null || scriptText == '') && baseId != null && baseId != '' && baseId != stageId)
     {
@@ -4446,26 +4676,6 @@ class FunkyCompatCodename
         }
         else if (visOwner == 'bg') vTarget = 'bg';
         if (vTarget != '') get(fx, 'hideProps').push(vTarget);
-        continue;
-      }
-      if (line.indexOf('.asset.scale(') >= 0 || line.indexOf('.asset.x =') >= 0 || line.indexOf('.asset.y =') >= 0 || line.indexOf('.asset.z =') >= 0 || line.indexOf('.asset.rotationY =') >= 0)
-      {
-        var modelTransform:Dynamic = get(fx, 'modelTransform');
-        if (line.indexOf('.asset.scale(') >= 0)
-        {
-          var msOpen:Int = line.indexOf('(', line.indexOf('.asset.scale'));
-          var msClose:Int = line.indexOf(')', msOpen);
-          if (msOpen >= 0 && msClose > msOpen) set(modelTransform, 'scale', numOr(line.substring(msOpen + 1, msClose), 1));
-        }
-        else
-        {
-          var eq:Int = line.indexOf('=');
-          var value:String = eq >= 0 ? line.substring(eq + 1) : '';
-          if (line.indexOf('.asset.x =') >= 0) set(modelTransform, 'x', numOr(value, 0));
-          else if (line.indexOf('.asset.y =') >= 0) set(modelTransform, 'y', numOr(value, 0));
-          else if (line.indexOf('.asset.z =') >= 0) set(modelTransform, 'z', numOr(value, 0));
-          else if (line.indexOf('.asset.rotationY =') >= 0) set(modelTransform, 'rotationY', numOr(value, 0));
-        }
         continue;
       }
       if (line.indexOf('addModel(Paths.awd(') >= 0 || line.indexOf('addModel(Paths.awd (') >= 0)

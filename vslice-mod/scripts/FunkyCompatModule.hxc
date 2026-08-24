@@ -38,35 +38,6 @@ class FunkyCompatModule extends Module
 
     trace('[FUNKY-COMPAT] Starting import pass...');
 
-    // Register the fake-3D wall-projection shader used by stages whose
-    // Codename scripts reference 3D models: the flat prerender is treated
-    // as a wall at world z=0 and sampled via ray intersection, giving
-    // true perspective parallax as the camera moves.
-    util.injectText('assets/shaders/fake3d.frag',
-      '#pragma header\n' +
-      'uniform float uCamX;\n' +
-      'uniform float uCamY;\n' +
-      'uniform float uCamZ;\n' +
-      'uniform vec2 uBase;\n' +
-      'uniform float uFocal;\n' +
-      'uniform vec2 uWall;\n' +
-      'void main()\n' +
-      '{\n' +
-      '  vec2 fc = openfl_TextureCoordv * openfl_TextureSize;\n' +
-      '  vec2 c = fc - openfl_TextureSize * 0.5;\n' +
-      '  vec3 dir = vec3(c.x, -c.y, uFocal);\n' +
-      '  float t = (0.0 - uCamZ) / dir.z;\n' +
-      '  vec2 world = vec2(uCamX, uCamY) + dir.xy * t;\n' +
-      '  vec2 rel = (world - uBase) / uWall;\n' +
-      '  vec2 uv = vec2(rel.x + 0.5, 0.5 - rel.y);\n' +
-      '  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)\n' +
-      '  {\n' +
-      '    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n' +
-      '    return;\n' +
-      '  }\n' +
-      '  gl_FragColor = flixel_texture2D(bitmap, uv);\n' +
-      '}');
-
     // Log which V-Slice build is running; non-0.8.x builds may need API
     // adjustments and the metadata api_version must match (install.sh).
     var gameVersion:String = '';
@@ -224,9 +195,6 @@ class FunkyCompatModule extends Module
     {
       trace('[FUNKY-COMPAT] ' + pendingStages.length + ' dynamic stage(s) pending registration.');
     }
-
-    // EXPERIMENTAL 3D: models are parsed per-stage via buildDynCfg when a
-    // stage script references models/<name>.awd (see extractDynFX).
   }
 
   var stagesRegistered:Bool = false;
