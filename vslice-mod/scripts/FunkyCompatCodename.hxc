@@ -7,6 +7,7 @@
 
 import haxe.Json;
 import StringTools;
+import openfl.utils.ByteArray;
 import funkin.util.ReflectUtil;
 import flixel.FlxG;
 
@@ -720,6 +721,10 @@ class FunkyCompatCodename
       var metaJson:Dynamic = util.readJson('$songBase/meta.json');
       if (metaJson == null) metaJson = {};
 
+      // Length (ms) of this song's instrumental, used below to drop notes
+      // charted past the end of the audio (see probeInstEndMs).
+      var instEndMs:Null<Float> = probeInstEndMs(dir, songFolder, metaJson);
+
       // Difficulties: meta list, or chart file names.
       var difficulties:Array<String> = [];
       var metaDiffs:Dynamic = get(metaJson, 'difficulties');
@@ -842,6 +847,7 @@ class FunkyCompatCodename
 
         var notesArr:Array<Dynamic> = [];
         var eventsArr:Array<Dynamic> = [];
+        var trimmedNotes:Int = 0;
         var scrollSpeed:Float = util.getFloat(get(chart, 'scrollSpeed'), 1);
         var warnedNoteTypes:Dynamic = {};
         var noteTypesRaw:Array<Dynamic> = get(chart, 'noteTypes');
@@ -854,7 +860,7 @@ class FunkyCompatCodename
           var songObj:Dynamic = chart;
           if (get(chart, 'song') != null && !isPrimitive(get(chart, 'song'))) songObj = get(chart, 'song');
           var legacyTimeChanges:Array<Dynamic> = [];
-          convertLegacyChart(songObj, bpm, notesArr, eventsArr, legacyTimeChanges);
+          convertLegacyChart(songObj, bpm, notesArr, eventsArr, legacyTimeChanges, instEndMs);
           if (get(songObj, 'speed') != null) scrollSpeed = util.getFloat(get(songObj, 'speed'), scrollSpeed);
           // BPM changes from long chart sections.
           for (tc in legacyTimeChanges)
@@ -934,6 +940,7 @@ class FunkyCompatCodename
                 if (noteType != 0)
                 {
                   if (noteTypesRaw != null && noteType < noteTypesRaw.length && noteTypesRaw[noteType] != null) noteKind = Std.string(noteTypesRaw[noteType]);
+                  else if (noteType == 1) noteKind = 'Alt Animation';
                   else noteKind = 'type$noteType';
                   if (get(warnedNoteTypes, 't$noteType') == null)
                   {
@@ -941,13 +948,37 @@ class FunkyCompatCodename
                     util.warn('Codename: note type $noteType ($noteKind) in $songId ($diff) preserved as kind "$noteKind"');
                   }
                 }
+                // Notes charted past the end of the audio can never be hit
+                // (V-Slice ends the song when the music completes), but they
+                // still count against the results-screen completion percent.
+                if (instEndMs != null && t > instEndMs)
+                {
+                  trimmedNotes++;
+                  continue;
+                }
                 var noteObj:Dynamic = {t: t, d: sideOffset + id};
-                if (sLen > 0) noteObj.l = sLen;
-                if (noteKind != '' && noteKind.toLowerCase() != 'normal' && noteKind.toLowerCase() != '0') noteObj.k = noteKind;
+                if (sLen > 0)
+                {
+                  // The song ends when the instrumental ends; clip hold
+                  // tails that would stretch past it.
+                  if (instEndMs != null && t + sLen > instEndMs) sLen = Math.max(0, instEndMs - t);
+                  if (sLen > 0) noteObj.l = sLen;
+                }
+                if (noteKind != '' && noteKind.toLowerCase() != 'normal' && noteKind.toLowerCase() != '0')
+                {
+                  var kToSet:String = noteKind;
+                  if (kToSet.toLowerCase() == 'alt animation') kToSet = 'alt';
+                  noteObj.k = kToSet;
+                }
                 notesArr.push(noteObj);
               }
             }
           }
+        }
+
+        if (trimmedNotes > 0)
+        {
+          util.warn('Codename: $songId ($diffId): $trimmedNotes note(s) lie after the instrumental (${Math.round(instEndMs / 100) / 10}s) - the song ends when the audio does, so they were dropped (they could never be hit and only lowered the clear percentage)');
         }
 
         // Chart-local events.
@@ -1632,10 +1663,14 @@ class FunkyCompatCodename
   }
 
   // Legacy psych-format sections -> vslice notes + time changes.
-  public function convertLegacyChart(song:Dynamic, startBpm:Float, notesOut:Array<Dynamic>, eventsOut:Array<Dynamic>, timeChangesOut:Array<Dynamic>):Void
+  // instEndMs: instrumental length (ms) or null - notes past it are dropped
+  // (unreachable once the song ends with the audio; see probeInstEndMs).
+  public function convertLegacyChart(song:Dynamic, startBpm:Float, notesOut:Array<Dynamic>, eventsOut:Array<Dynamic>, timeChangesOut:Array<Dynamic>, instEndMs:Null<Float> = null):Void
   {
     var sections:Array<Dynamic> = get(song, 'notes');
     if (sections == null) return;
+
+    var trimmedNotes:Int = 0;
 
     var currentBpm:Float = startBpm;
     var currentTime:Float = 0.0;
@@ -1741,8 +1776,21 @@ class FunkyCompatCodename
             eventsOut.push({t: t, e: 'PlayAnimation', v: {target: 'gf', anim: gfAnim, force: true}});
           }
           var noteObj:Dynamic = {t: t, d: vsliceD};
-          if (sus > 0) noteObj.l = sus;
+          if (sus > 0)
+          {
+            // Clip hold tails that would stretch past the audio's end; see
+            // probeInstEndMs - the song ends when the instrumental does.
+            if (instEndMs != null && t + sus > instEndMs) sus = Math.max(0, instEndMs - t);
+            if (sus > 0) noteObj.l = sus;
+          }
           if (noteType == 'No Animation') noteObj.k = 'noanim';
+          // Notes charted past the end of the audio can never be hit, but
+          // still count against the results-screen completion percent.
+          if (instEndMs != null && t > instEndMs)
+          {
+            trimmedNotes++;
+            continue;
+          }
           notesOut.push(noteObj);
         }
       }
@@ -1750,6 +1798,10 @@ class FunkyCompatCodename
       var beatMs:Float = 60000.0 / currentBpm;
       currentTime += beats * beatMs;
       currentBeat += beats;
+    }
+    if (trimmedNotes > 0)
+    {
+      util.warn('Codename: legacy chart trimmed $trimmedNotes note(s) past the instrumental end (unreachable, would only lower the clear percentage)');
     }
   }
 
@@ -1837,6 +1889,83 @@ class FunkyCompatCodename
     if (name == 'cubicout' || name == 'cubeout') return 'cubeOut';
     if (name == 'cubicinout' || name == 'cubeinout') return 'cubeInOut';
     return name;
+  }
+
+  // ------------------------------------------------------------------
+  // Audio length probing
+  // ------------------------------------------------------------------
+
+  // Some Codename charts outlive their audio (the track was shortened after
+  // charting, e.g. gumballs' "memory card"). V-Slice - like Codename itself -
+  // ends the song when the instrumental completes, so notes past the end are
+  // unreachable, yet they still count against the results screen's completion
+  // percentage, capping a perfect run below 100%. Resolve the instrumental
+  // the same way addCodenameAudio does and return its length in ms, or null
+  // when it can't be determined (missing audio, non-OGG container).
+  public function probeInstEndMs(dir:String, folder:String, meta:Dynamic):Null<Float>
+  {
+    var songBase:String = 'mods/$dir/songs/$folder/song';
+    var instSuffix:String = util.getString(get(meta, 'instSuffix'), '');
+    var instFile:String = 'Inst.ogg';
+    if (instSuffix != null && instSuffix != '') instFile = 'Inst-$instSuffix.ogg';
+    var bytes:ByteArray = util.readBytes('$songBase/$instFile');
+    if (bytes == null && instFile != 'Inst.ogg') bytes = util.readBytes('$songBase/Inst.ogg');
+    if (bytes == null || bytes.length < 40) return null;
+    return probeOggMs(bytes);
+  }
+
+  // Vorbis duration from the OGG container: walk the pages and take the last
+  // granule position (total decoded samples), divided by the sample rate from
+  // the identification header. Returns ms, or null if the file isn't a valid
+  // Vorbis stream. Mirrors a plain OGG page walk: 'OggS' header, granule at
+  // 6..14, segment count at 26, lacing table, then the page body.
+  function probeOggMs(bytes:ByteArray):Null<Float>
+  {
+    if (bytes.get(0) != 0x4F || bytes.get(1) != 0x67 || bytes.get(2) != 0x67 || bytes.get(3) != 0x53) return null; // 'OggS'
+
+    // Sample rate: the vorbis identification packet ('\x01vorbis', version,
+    // channels, then a 4-byte sample rate) starts after the first page's
+    // 27-byte header and its lacing table.
+    var segCount:Int = bytes.get(26);
+    var ident:Int = 27 + segCount;
+    var sampleRate:Int = 0;
+    if (ident + 16 < bytes.length && bytes.get(ident) == 0x01 && bytes.get(ident + 1) == 0x76 && bytes.get(ident + 2) == 0x6F
+      && bytes.get(ident + 3) == 0x72 && bytes.get(ident + 4) == 0x62 && bytes.get(ident + 5) == 0x69 && bytes.get(ident + 6) == 0x73)
+    {
+      sampleRate = le32(bytes, ident + 12);
+    }
+    if (sampleRate <= 0) return null;
+
+    var pos:Int = 0;
+    var lastGranule:Float = -1;
+    while (pos + 27 <= bytes.length)
+    {
+      if (bytes.get(pos) != 0x4F || bytes.get(pos + 1) != 0x67 || bytes.get(pos + 2) != 0x67 || bytes.get(pos + 3) != 0x53) break;
+      var segs:Int = bytes.get(pos + 26);
+      var pageLen:Int = 27 + segs;
+      if (pos + pageLen > bytes.length) break;
+      for (s in 0...segs)
+      {
+        pageLen += bytes.get(pos + 27 + s);
+      }
+      if (pos + pageLen > bytes.length) break;
+
+      // Granule is a 64-bit unsigned sample count; combine hi/lo as Float so
+      // no precision is lost well past any song length.
+      var lo:Int = le32(bytes, pos + 6);
+      var hi:Int = le32(bytes, pos + 10);
+      var granule:Float = hi * 4294967296.0 + (lo >= 0 ? lo : lo + 4294967296.0);
+      if (granule > 0) lastGranule = granule;
+      pos += pageLen;
+    }
+    if (lastGranule <= 0) return null;
+    return lastGranule / sampleRate * 1000.0;
+  }
+
+  // Little-endian 32-bit read (ByteArray alignment-independent).
+  function le32(bytes:ByteArray, off:Int):Int
+  {
+    return bytes.get(off) | (bytes.get(off + 1) << 8) | (bytes.get(off + 2) << 16) | (bytes.get(off + 3) << 24);
   }
 
   public function addCodenameAudio(dir:String, folder:String, songId:String, player:String, opponent:String, meta:Dynamic, out:Dynamic):Void
