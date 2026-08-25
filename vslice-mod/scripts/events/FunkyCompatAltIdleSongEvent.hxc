@@ -1,0 +1,128 @@
+// funky-compat - universal 'Alt Animation Toggle' idle half.
+//
+// Codename's 'Alt Animation Toggle' also flips each character's IDLE suffix
+// to '-alt' (character.idleSuffix = "-alt"), so while the toggle is active
+// the characters loop their '-alt' idle animation between phrases. V-Slice
+// has no character idle-suffix property, so this song event reproduces the
+// effect: at every beat, while enabled, it re-issues the character's '-alt'
+// idle animation (if the character actually has one).
+//
+//   { 'e': 'FunkyCompatAltIdle', 'v': { 'line': 0, 'on': true } }
+//
+// line uses Codename strumline numbering (0 = opponent/dad, 1 = player,
+// 2 = girlfriend). on=false silently returns control to the engine's normal
+// idle loop. The event is emitted at conversion time for every
+// 'Alt Animation Toggle' whose params[1] (idle) is set.
+
+import funkin.play.event.SongEvent;
+import funkin.play.PlayState;
+import flixel.FlxG;
+
+class FunkyCompatAltIdleSongEvent extends SongEvent
+{
+  var idleSuffixOn:Bool;
+  var targetLine:Int;
+
+  public function new()
+  {
+    super('FunkyCompatAltIdle');
+    this.idleSuffixOn = false;
+    this.targetLine = 0;
+  }
+
+  public function getTitle():String
+  {
+    return 'Alt Idle (funky-compat)';
+  }
+
+  public function getEventSchema():Dynamic
+  {
+    return [
+      {name: 'line', title: 'Strumline', defaultValue: 0, type: 'int'},
+      {name: 'on', title: 'Enable', defaultValue: true, type: 'bool'}
+    ];
+  }
+
+  override function handleEvent(data:Dynamic):Void
+  {
+    if (data == null || data.value == null) return;
+    this.targetLine = data.value.line != null ? Std.int(data.value.line) : 0;
+    this.idleSuffixOn = data.value.on != null ? (data.value.on == true || data.value.on == 1) : false;
+  }
+
+  // The registry reuses ONE instance for every song and restart, so the
+  // toggle state must not leak between runs: re-enable the engine's normal
+  // idle when the song is left by any route.
+  override function onSongEnd(event:Dynamic):Void
+  {
+    this.idleSuffixOn = false;
+  }
+
+  override function onGameOver(event:Dynamic):Void
+  {
+    this.idleSuffixOn = false;
+  }
+
+  override function onDestroy(event:Dynamic):Void
+  {
+    this.idleSuffixOn = false;
+  }
+
+  override function onBeatHit(event:Dynamic):Void
+  {
+    if (!this.idleSuffixOn) return;
+    if (PlayState.instance == null) return;
+    var character:Dynamic = resolveCharacter();
+    if (character == null) return;
+
+    // Only swap the idle while the character is NOT singing - the sing
+    // animations (including the '-alt' sing variants) are handled by the
+    // note kind, and forcing 'idle-alt' mid-sing would fight them.
+    if (character.isSinging != null && character.isSinging()) return;
+
+    var altIdle:String = idleAnimName(character);
+    if (altIdle == '') return;
+    // Re-issue on every beat so the engine's own idle retrigger cannot
+    // override the '-alt' loop while the toggle is active.
+    try
+    {
+      character.playAnimation(altIdle);
+    }
+    catch (e:Dynamic)
+    {
+      // Character animation API differences between builds: ignore.
+    }
+  }
+
+  function idleAnimName(character:Dynamic):String
+  {
+    // Prefer the character's '-alt' idle variant; fall back to nothing when
+    // the character has no such animation (Codename does the same - a
+    // character without alt animations just keeps its default idle).
+    try
+    {
+      if (character.hasAnimation != null && character.hasAnimation('idle-alt')) return 'idle-alt';
+      // hasAnimation may not exist on scripted characters; check the anim
+      // map directly instead.
+      if (character.animation != null && character.animation.getByName('idle-alt') != null) return 'idle-alt';
+    }
+    catch (e:Dynamic) {}
+    return '';
+  }
+
+  // Codename strumline index -> V-Slice character reference.
+  function resolveCharacter():Dynamic
+  {
+    if (PlayState.instance == null || PlayState.instance.currentStage == null) return null;
+    var stage:Dynamic = PlayState.instance.currentStage;
+    switch (this.targetLine)
+    {
+      case 1:
+        return stage.getBoyfriend();
+      case 2:
+        return stage.getGirlfriend();
+      default:
+        return stage.getDad();
+    }
+  }
+}

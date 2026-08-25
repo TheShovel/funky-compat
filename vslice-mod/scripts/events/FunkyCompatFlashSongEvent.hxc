@@ -2,6 +2,7 @@ import funkin.play.event.SongEvent;
 import flixel.FlxG;
 import flixel.util.FlxColor;
 import funkin.play.PlayState;
+import StringTools;
 
 class FunkyCompatFlashSongEvent extends SongEvent
 {

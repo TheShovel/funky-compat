@@ -1,0 +1,25 @@
+// funky-compat - universal 'alt' note kind.
+//
+// Codename charts mark alt phrases two ways: per-note type 1 ("Alt
+// Animation") and whole-span 'Alt Animation Toggle' events. Both map to the
+// note kind 'alt' at import time (see FunkyCompatCodename). V-Slice renders
+// a note kind's animation SUFFIX when a character sings, so this registered
+// kind makes every 'alt'-kind note play the character's '-alt' sing
+// animations - exactly what Codename's strumline.altAnim flag does. Without
+// it, 'alt'-kind notes behave like ordinary notes (the kind resolves to
+// null because no built-in kind exists).
+//
+// This class must live in the LAYER mod's own scripts/ folder (a real
+// mounted file) - scripted classes cannot be injected via the asset cache.
+// NoteKindManager scans scripted subclasses at boot, mirroring how the
+// layer's FunkyCompatFlash/FunkyCompatAspect song events are registered.
+
+import funkin.play.notes.notekind.NoteKind;
+
+class AltNoteKind extends NoteKind
+{
+  public function new()
+  {
+    super('alt', 'Alt Animation (funky-compat)', null, [], false, 'alt');
+  }
+}

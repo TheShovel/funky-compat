@@ -619,12 +619,21 @@ class FunkyCompatCodename
     return result;
   }
 
-  // Read key="value" from an attr-body string.
+  // Read key="value" from an attr-body string. The key match is spaced
+  // (not a bare substring): 'x=' must not match inside 'camx='/'scalex=',
+  // otherwise characters that omit an 'x' attribute inherit their camx.
   public function attr(body:String, name:String):Null<String>
   {
     if (body == null) return null;
     var needle:String = name + '=';
     var idx:Int = body.indexOf(needle);
+    while (idx >= 0)
+    {
+      var prevChar:String = idx > 0 ? body.charAt(idx - 1) : ' ';
+      var boundary:Bool = !((prevChar >= 'a' && prevChar <= 'z') || (prevChar >= 'A' && prevChar <= 'Z') || (prevChar >= '0' && prevChar <= '9') || prevChar == '_');
+      if (boundary) break;
+      idx = body.indexOf(needle, idx + 1);
+    }
     if (idx < 0) return null;
     var rest:String = body.substring(idx + needle.length);
     if (rest.length == 0) return null;
@@ -852,6 +861,8 @@ class FunkyCompatCodename
         var warnedNoteTypes:Dynamic = {};
         var noteTypesRaw:Array<Dynamic> = get(chart, 'noteTypes');
         if (noteTypesRaw == null && get(chart, 'meta') != null) noteTypesRaw = get(get(chart, 'meta'), 'noteTypes');
+        // Alt Animation Toggle spans, folded into per-note kinds below.
+        var altSpans:Array<Dynamic> = buildAltSpans(chart);
 
         // Codename mods may embed legacy/psych-format charts; the engine
         // converts them at runtime. We do the same conversion ourselves.
@@ -957,6 +968,10 @@ class FunkyCompatCodename
                   continue;
                 }
                 var noteObj:Dynamic = {t: t, d: sideOffset + id};
+                // Notes inside an Alt Animation Toggle span play '-alt'
+                // animations via the layer's 'alt' note kind (unless the note
+                // already has a specialised kind of its own).
+                if (noteKind == '' && inAltSpan(altSpans, sl, t)) noteObj.k = 'alt';
                 if (sLen > 0)
                 {
                   // The song ends when the instrumental ends; clip hold
@@ -997,7 +1012,7 @@ class FunkyCompatCodename
         }
 
         set(notesJson, diffId, notesArr);
-        appendUnique(flatEvents, seenEvents, mapEvents(eventsArr, songId, diffId, timeChangeEvents));
+        appendUnique(flatEvents, seenEvents, mapEvents(eventsArr, songId, diffId, timeChangeEvents, bpm));
         set(scrollSpeeds, diffId, scrollSpeed);
       }
 
@@ -1148,6 +1163,19 @@ class FunkyCompatCodename
             calls.push({t: callTime, step: eventStep(callTime, bpm, timeChangeEvents), fn: callFn, args: callParams});
         }
         set(stageCallEvents, stageId, calls);
+      }
+
+      // Portable song choreography (script-created actors, beat-triggered
+      // tweens/flips, event-driven animations) from the song's HScript.
+      // Played back at runtime by the layer's FunkyCompatChoreo event.
+      var choreo:Dynamic = extractCodenameChoreo(dir, songFolder, stageId, stageBaseId);
+      if (choreo != null
+        && (get(choreo, 'sprites').length > 0 || get(choreo, 'characters').length > 0
+          || get(choreo, 'beats').length > 0 || get(choreo, 'camAnims').length > 0
+          || ReflectUtil.fields(get(choreo, 'calls')).length > 0))
+      {
+        flatEvents.push({t: 0, e: 'FunkyCompatChoreo', v: choreo});
+        trace('[FUNKY-COMPAT] Codename choreography for "$songId": ' + get(choreo, 'sprites').length + ' sprites, ' + get(choreo, 'characters').length + ' chars, ' + get(choreo, 'beats').length + ' beat groups, ' + get(choreo, 'camAnims').length + ' cam-anims, ' + ReflectUtil.fields(get(choreo, 'calls')).length + ' call fn(s)');
       }
 
       // Square/4:3-era mods framed their stages for a narrower view. The
@@ -1346,8 +1374,33 @@ class FunkyCompatCodename
     return Std.int(Math.floor(step + 0.0001));
   }
 
-  // Map codename events to vslice events.
-  public function mapEvents(raw:Array<Dynamic>, songId:String, diff:String, timeChangeOut:Array<Dynamic>):Array<Dynamic>
+  // The BPM in effect at an absolute time (ms), walking accumulated changes.
+  public function songBpmAt(t:Float, baseBpm:Float, changes:Array<Dynamic>):Float
+  {
+    var bpm:Float = baseBpm;
+    if (changes != null)
+    {
+      for (change in changes)
+      {
+        var ct:Float = util.getFloat(get(change, 't'), 0);
+        if (ct > t) continue;
+        var nextBpm:Float = util.getFloat(get(change, 'bpm'), -1);
+        if (nextBpm > 0) bpm = nextBpm;
+      }
+    }
+    return bpm;
+  }
+
+  // Milliseconds per step (a step is a quarter beat) at an absolute time.
+  public function stepLengthMsAt(t:Float, baseBpm:Float, changes:Array<Dynamic>):Float
+  {
+    return 60000.0 / songBpmAt(t, baseBpm, changes) / 4;
+  }
+
+  // Map codename events to vslice events. baseBpm is the song's starting BPM
+  // (timeChangeOut accumulates 'BPM Change'/'Time Signature Change' entries
+  // and is used to convert Codename's step/measure durations to real time).
+  public function mapEvents(raw:Array<Dynamic>, songId:String, diff:String, timeChangeOut:Array<Dynamic>, baseBpm:Float = 100):Array<Dynamic>
   {
     var result:Array<Dynamic> = [];
     for (ei in 0...raw.length)
@@ -1399,6 +1452,7 @@ class FunkyCompatCodename
           ease = mapEaseName(Std.string(params[3]));
           if (params.length > 4) easeDir = Std.string(params[4]);
         }
+        if (easeDir == null || easeDir == '') easeDir = 'In';
         result.push({t: t, e: 'FocusCamera', v: {char: charIdx, duration: duration, ease: ease, easeDir: easeDir}});
         continue;
       }
@@ -1416,7 +1470,15 @@ class FunkyCompatCodename
         {
           var px:Float = util.getFloat(params[0], 0);
           var py:Float = util.getFloat(params[1], 0);
-          result.push({t: t, e: 'FocusCamera', v: {char: -1, x: px, y: py, duration: 2, ease: 'quad', easeDir: 'InOut'}});
+          var posDur:Float = 4;
+          if (params.length > 3) posDur = Math.max(0.25, util.getFloat(params[3], 4));
+          var posEase:String = 'quad';
+          if (params.length > 4 && params[4] != null && Std.string(params[4]).toLowerCase() == 'classic') posEase = 'CLASSIC';
+          else if (params.length > 4 && params[4] != null) posEase = mapEaseName(Std.string(params[4]));
+          var posEaseDir:String = 'InOut';
+          if (params.length > 5) posEaseDir = Std.string(params[5]);
+          if (posEaseDir == null || posEaseDir == '') posEaseDir = 'InOut';
+          result.push({t: t, e: 'FocusCamera', v: {char: -1, x: px, y: py, duration: posDur, ease: posEase, easeDir: posEaseDir}});
         }
         continue;
       }
@@ -1432,6 +1494,7 @@ class FunkyCompatCodename
         if (params.length > 3) duration = Math.max(0.25, util.getFloat(params[3], 4));
         if (params.length > 4) ease = mapEaseName(Std.string(params[4]));
         if (params.length > 5) easeDir = Std.string(params[5]);
+        if (easeDir == null || easeDir == '') easeDir = 'InOut';
         var shouldTween:Bool = true;
         if (params.length > 0) shouldTween = util.getBool(params[0], true);
         if (!shouldTween) duration = 0;
@@ -1474,6 +1537,7 @@ class FunkyCompatCodename
           var easeDir:String = 'InOut';
           if (params.length > 3) ease = mapEaseName(Std.string(params[3]));
           if (params.length > 4) easeDir = Std.string(params[4]);
+          if (easeDir == null || easeDir == '') easeDir = 'InOut';
           result.push({t: t, e: 'ZoomCamera', v: {zoom: zoom, duration: duration, ease: ease, easeDir: easeDir, mode: 'direct'}});
         }
         else
@@ -1500,17 +1564,6 @@ class FunkyCompatCodename
         result.push({t: t, e: 'ScrollSpeed', v: {scroll: scroll, duration: duration, absolute: absolute, strumline: 'both'}});
         continue;
       }
-      if (name == 'Camera Position')
-      {
-        var x:Float = 0;
-        var y:Float = 0;
-        var isOffset:Bool = false;
-        if (params.length > 0) x = util.getFloat(params[0], 0);
-        if (params.length > 1) y = util.getFloat(params[1], 0);
-        if (params.length > 6) isOffset = util.getBool(params[6], false);
-        result.push({t: t, e: 'FocusCamera', v: {char: -1, x: x, y: y, offset: isOffset}});
-        continue;
-      }
       if (name == 'Play Animation')
       {
         var target:String = 'boyfriend';
@@ -1525,11 +1578,17 @@ class FunkyCompatCodename
       if (name == 'Camera Flash' || name == 'Fancy Camera Flash')
       {
         // Codename params: [reversed, colorHex, durationSteps, camera?]
+        // The duration is in STEPS; convert to seconds with the step length
+        // in effect at this event's time (BPM changes included).
         var color:String = '#FFFFFF';
-        var duration:Float = 1;
+        var duration:Float = 0.5;
         var target:String = 'game';
         if (params.length > 1 && params[1] != null) color = Std.string(params[1]);
-        if (params.length > 2 && params[2] != null) duration = Math.max(0.1, util.getFloat(params[2], 1) * 0.25);
+        if (params.length > 2 && params[2] != null)
+        {
+          var flashSteps:Float = Math.max(1, util.getFloat(params[2], 1));
+          duration = Math.max(0.05, flashSteps * stepLengthMsAt(t, baseBpm, timeChangeOut) / 1000.0);
+        }
         if (params.length > 3 && params[3] != null) target = Std.string(params[3]);
         if (color == null || color == '') color = '#FFFFFF';
         result.push({t: t, e: 'FunkyCompatFlash', v: {color: color, duration: duration, target: target}});
@@ -1537,26 +1596,41 @@ class FunkyCompatCodename
       }
       if (name == 'Camera Modulo Change')
       {
-        // Codename params: [interval, strength, type, offset] - maps to bop rate/strength.
+        // Codename params: [interval, strength, type(BEAT/STEP/MEASURE), offset].
+        // Zooms the camera ONCE PER interval; V-Slice's SetCameraBop rate is
+        // in beats (and 1 beat = 4 steps = 1/4 of a measure), so normalize
+        // the interval/offset into beats.
         var interval:Float = 4;
         var strength:Float = 1;
+        var offset:Float = 0;
+        var modUnit:String = 'BEAT';
         if (params.length > 0) interval = Math.max(0.25, util.getFloat(params[0], 4));
         if (params.length > 1) strength = util.getFloat(params[1], 1);
-        result.push({t: t, e: 'SetCameraBop', v: {rate: interval, intensity: strength}});
+        if (params.length > 2 && params[2] != null) modUnit = Std.string(params[2]).toUpperCase();
+        if (params.length > 3) offset = util.getFloat(params[3], 0);
+        if (modUnit == 'STEP')
+        {
+          interval = interval / 4;
+          offset = offset / 4;
+        }
+        else if (modUnit == 'MEASURE')
+        {
+          interval = interval * 4;
+          offset = offset * 4;
+        }
+        result.push({t: t, e: 'SetCameraBop', v: {rate: interval, intensity: strength, offset: offset}});
         continue;
       }
       if (name == 'Alt Animation Toggle')
       {
-        // Codename toggles idle/sing suffix to "-alt" for characters/strumlines.
-        // V-Slice handles alt via note kind; map to a generic PlayAnimation suffix toggle via Stage prop if needed.
-        // For now emit SetCameraBop-like no-op but warn less - map sing/idle toggles to character suffix.
-        // We treat param0=sing toggle, param1=idle toggle.
-        var singToggle:Bool = params.length > 0 ? util.getBool(params[0], false) : false;
-        var idleToggle:Bool = params.length > 1 ? util.getBool(params[1], false) : false;
-        // Emit as PlayAnimation with -alt suffix hint if toggled
-        if (singToggle || idleToggle)
+        // The SING half is folded into per-note kinds at conversion time
+        // (buildAltSpans); the IDLE half is a runtime character property, so
+        // it is emitted as the layer's FunkyCompatAltIdle event (on and off).
+        if (params.length > 1 && params[1] != null)
         {
-          util.warn('Codename: Alt Animation Toggle in $songId ($diff) - alt animations use -alt suffix, ensure character has them');
+          var idleToggle:Bool = util.getBool(params[1], false);
+          var toggleLine:Int = params.length > 2 ? util.getInt(params[2], 0) : 0;
+          result.push({t: t, e: 'FunkyCompatAltIdle', v: {line: toggleLine, on: idleToggle}});
         }
         continue;
       }
@@ -1571,7 +1645,11 @@ class FunkyCompatCodename
       }
       if (name == 'HScript Call')
       {
-        // Handled via callEvents replay in DynStage - not a V-Slice song event.
+        // Fired as a dedicated event so the song-choreography player can
+        // replay the portable actions extracted from the named function
+        // body (DynStage separately replays stage-scope calls).
+        var callFn:String = params.length > 0 ? Std.string(params[0]) : '';
+        if (callFn != '') result.push({t: t, e: 'FunkyCompatChoreoCall', v: {fn: callFn}});
         continue;
       }
       if (name == 'Move Strumline' || name == 'Cinematics' || name == 'camera_captain')
@@ -1609,6 +1687,96 @@ class FunkyCompatCodename
     if (idx == 0) return 'dad';
     if (idx == 2) return 'girlfriend';
     return 'boyfriend';
+  }
+
+  // 'Alt Animation Toggle' events flip a strumline's notes to '-alt'
+  // animations from the toggle until the NEXT toggle for that strumline (or
+  // the chart end). Fold this into V-Slice's per-note kind mechanism: return
+  // [{line, s, e}] spans; notes inside get the layer's 'alt' note kind
+  // (registered separately), whose suffix makes characters play their
+  // '-alt' sing animations. Strstumline indices follow the chart's strumLines
+  // array (0 = opponent/dad, 1 = player, 2 = girlfriend).
+  public function buildAltSpans(chart:Dynamic):Array<Dynamic>
+  {
+    var spans:Array<Dynamic> = [];
+    var events:Dynamic = chart == null ? null : get(chart, 'events');
+    if (events == null) return spans;
+    var toggles:Array<Dynamic> = [];
+    for (evt in events)
+    {
+      if (evt == null) continue;
+      if (util.getString(get(evt, 'name'), '') != 'Alt Animation Toggle') continue;
+      var tp:Dynamic = get(evt, 'params');
+      if (tp == null || tp.length < 1) continue;
+      toggles.push({line: tp.length > 2 ? util.getInt(tp[2], 0) : 0, t: util.getFloat(get(evt, 'time'), 0), sing: util.getBool(tp[0], false)});
+    }
+    if (toggles.length == 0) return spans;
+    toggles.sort(function(a:Dynamic, b:Dynamic):Int
+    {
+      var ta:Float = util.getFloat(get(a, 't'), 0);
+      var tb:Float = util.getFloat(get(b, 't'), 0);
+      if (ta < tb) return -1;
+      if (ta > tb) return 1;
+      return 0;
+    });
+
+    // An open-ended toggle runs to the chart's last note (+5s safety tail).
+    var chartEndMs:Float = 600000;
+    var lastNoteTime:Float = 0;
+    var lines:Dynamic = chart == null ? null : get(chart, 'strumLines');
+    if (lines != null)
+    {
+      for (ln in lines)
+      {
+        var lnNotes:Dynamic = ln == null ? null : get(ln, 'notes');
+        if (lnNotes == null) continue;
+        for (n in lnNotes)
+        {
+          if (n == null) continue;
+          var nt:Float = util.getFloat(get(n, 'time'), 0);
+          if (nt > lastNoteTime) lastNoteTime = nt;
+        }
+      }
+    }
+    if (lastNoteTime > 0) chartEndMs = lastNoteTime + 5000;
+
+    // Flip on/off per strumline.
+    var open:Dynamic = {};
+    for (tg in toggles)
+    {
+      var line:Int = util.getInt(get(tg, 'line'), 0);
+      var sing:Bool = get(tg, 'sing') == true;
+      var t:Float = util.getFloat(get(tg, 't'), 0);
+      var prev:Dynamic = get(open, line);
+      if (prev != null)
+      {
+        if (get(prev, 'sing') == true) spans.push({line: line, s: util.getFloat(get(prev, 't'), 0), e: t});
+        set(open, line, null);
+      }
+      if (sing) set(open, line, tg);
+    }
+    for (lineKey in ReflectUtil.fields(open))
+    {
+      var remaining:Dynamic = get(open, lineKey);
+      if (remaining != null && get(remaining, 'sing') == true)
+      {
+        spans.push({line: Std.parseInt(lineKey), s: util.getFloat(get(remaining, 't'), 0), e: chartEndMs});
+      }
+    }
+    return spans;
+  }
+
+  // Whether a note (strumline index + time in ms) falls inside an alt span.
+  public function inAltSpan(spans:Array<Dynamic>, line:Int, t:Float):Bool
+  {
+    if (spans == null) return false;
+    for (span in spans)
+    {
+      if (span == null) continue;
+      if (util.getInt(get(span, 'line'), -1) != line) continue;
+      if (t >= util.getFloat(get(span, 's'), 0) - 0.001 && t <= util.getFloat(get(span, 'e'), 0)) return true;
+    }
+    return false;
   }
 
   // V-Slice chart events are a single flat array shared by every difficulty
@@ -1873,22 +2041,22 @@ class FunkyCompatCodename
 
   public function mapEaseName(nameRaw:String):String
   {
-    var name:String = nameRaw.toLowerCase();
-    // Codename tween ease names overlap with flixel's.
-    if (name == 'classic') return 'linear';
-    if (name == 'sine' || name == 'sinein') return 'sineIn';
-    if (name == 'sineout') return 'sineOut';
-    if (name == 'sineinout') return 'sineInOut';
-    if (name == 'quad' || name == 'quadin') return 'quadIn';
-    if (name == 'quadout') return 'quadOut';
-    if (name == 'quadinout') return 'quadInOut';
-    if (name == 'expoin') return 'expoIn';
-    if (name == 'expoout') return 'expoOut';
-    if (name == 'expoinout') return 'expoInOut';
-    if (name == 'cubicin') return 'cubeIn';
-    if (name == 'cubicout' || name == 'cubeout') return 'cubeOut';
-    if (name == 'cubicinout' || name == 'cubeinout') return 'cubeInOut';
-    return name;
+    var name:String = StringTools.trim(nameRaw).toLowerCase();
+    // V-Slice composes 'ease' + 'easeDir' into the FlxEase symbol, so this
+    // returns the BASE name ('quad' + 'Out' -> FlxEase.quadOut). Baked
+    // directions in the source ('sineInOut') are stripped back to the base.
+    if (name == '' || name == 'classic') return 'linear';
+    if (name == 'linear') return 'linear';
+    if (StringTools.endsWith(name, 'inout')) name = name.substring(0, name.length - 5);
+    else if (StringTools.endsWith(name, 'out')) name = name.substring(0, name.length - 3);
+    else if (StringTools.endsWith(name, 'in') && name.length > 3) name = name.substring(0, name.length - 2);
+    switch (name)
+    {
+      case 'cubic': return 'cube';
+      case 'smoothstep': return 'smoothStep';
+      case 'smootherstep': return 'smootherStep';
+      default: return name;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -2411,9 +2579,1427 @@ class FunkyCompatCodename
   }
 
   // ------------------------------------------------------------------
-  // Stages (XML -> JSON)
+  // Song choreography extraction (generic, script-driven)
   // ------------------------------------------------------------------
 
+  // Extract the portable subset of a Codename song's HScript choreography
+  // (song scripts/events.hx plus the companion stage script) into data the
+  // FunkyCompatChoreo song event can replay: created sprites/characters,
+  // beat-triggered visibility/tweens/flips, event-driven playAnim calls and
+  // function bodies invoked by 'HScript Call' events. Only these constrained
+  // script-lit patterns are recognized - arbitrary code is never executed.
+  public function extractCodenameChoreo(dir:String, songFolder:String, stageId:String, stageBaseId:String):Dynamic
+  {
+    var program:Dynamic = {sprites: [], characters: [], beats: [], camAnims: [], calls: {}, order: []};
+    var text:String = '';
+    // Stage script first: its create()-time actors (like the "guy in the
+    // wall") are pushed before the song script's loop-created actors, and
+    // runtime array indexing relies on that same creation order.
+    var stageText:String = stageScriptText(dir, stageId);
+    if ((stageText == null || stageText == '') && stageBaseId != null && stageBaseId != '' && stageBaseId != stageId) stageText = stageScriptText(dir, stageBaseId);
+    if (stageText != null) text += stageText + '\n';
+    var songScripts:Array<String> = util.listDir('mods/$dir/songs/$songFolder/scripts');
+    for (sFile in songScripts)
+    {
+      if (!StringTools.endsWith(sFile.toLowerCase(), '.hx')) continue;
+      var t:String = util.readText('mods/$dir/songs/$songFolder/scripts/$sFile');
+      if (t != null) text += t + '\n';
+    }
+    if (text == '') return program;
+
+    extractChoreoProgram(text, program);
+    trace('[FUNKY-COMPAT] choreo($songFolder) -> sprites=' + get(program, 'sprites').length + ' chars=' + get(program, 'characters').length + ' beats=' + get(program, 'beats').length + ' cam=' + get(program, 'camAnims').length + ' order=' + get(program, 'order').length);
+    return program;
+  }
+
+  // Line-scan a combined HScript body for the portable choreography patterns.
+  function extractChoreoProgram(text:String, program:Dynamic):Void
+  {
+    var lines:Array<String> = text.split('\n');
+
+    // Constant array-of-arrays tables (e.g. 'var offsets = [[..],[..]]')
+    // used by loop-driven choreography (dupe/sign placement). Tables may
+    // span several lines, so join from 'var NAME = [' until brackets close.
+    var tables:Dynamic = {};
+    var tableAcc:Dynamic = null;
+    var tableAccName:String = '';
+    var tableDepth:Int = 0;
+    for (raw in lines)
+    {
+      var line:String = StringTools.trim(raw);
+      if (tableAcc != null)
+      {
+        tableAcc += line + ' ';
+        tableDepth += countChar(line, '[') - countChar(line, ']');
+        if (tableDepth <= 0)
+        {
+          var parsed:Array<Dynamic> = parseConstTable(tableAcc);
+          if (parsed != null && parsed.length > 0) set(tables, tableAccName, parsed);
+          tableAcc = null;
+          tableAccName = '';
+        }
+        continue;
+      }
+      if (StringTools.startsWith(line, 'var '))
+      {
+        var eq:Int = line.indexOf('=');
+        if (eq > 4)
+        {
+          var varName:String = StringTools.trim(line.substring(4, eq));
+          // Type-annotated declarations ('var dupes:Array<Character> = []') or
+          // other non-identifier names are not loop tables.
+          if (!isPlainIdent(varName)) continue;
+          var inner:String = StringTools.trim(line.substring(eq + 1));
+          if (inner == '[')
+          {
+            tableAcc = inner;
+            tableAccName = varName;
+            tableDepth = 1;
+            continue;
+          }
+          if (StringTools.endsWith(inner, ';')) inner = StringTools.trim(inner.substring(0, inner.length - 1));
+          if (inner.length >= 2 && inner.charAt(0) == '[' && inner.charAt(inner.length - 1) == ']')
+          {
+            var parsedOne:Array<Dynamic> = parseConstTable(inner);
+            if (parsedOne != null && parsedOne.length > 0) set(tables, varName, parsedOne);
+          }
+        }
+      }
+    }
+
+    // Loop tables also travel with the program: per-entry tween values and
+    // delays ('dad.y + offsets[a][3]') resolve against them at play time.
+    if (ReflectUtil.fields(tables).length > 0) set(program, 'tables', tables);
+
+    var activeFn:String = '';
+    var fnDepth:Int = 0;
+    var inBeatHit:Bool = false;
+    var beatCase:Int = -1;
+    var loopVar:String = '';
+    var loopList:String = '';
+    var loopCount:Int = -1;
+    // Branch condition for table-loop creations ('if (!o[6])' / 'else'):
+    // creations inside only apply to entries matching the test.
+    var condIdx:Int = -1;
+    var condWant:Bool = true;
+    var condActive:Bool = false;
+    var condDepth:Int = 0;
+    var condTbl:String = '';
+
+    for (raw in lines)
+    {
+      var line:String = StringTools.trim(raw);
+      if (line == '') continue;
+      if (line.indexOf('function ') == 0)
+      {
+        var open:Int = line.indexOf('(');
+        var name:String = open > 9 ? StringTools.trim(line.substring(9, open)) : '';
+        activeFn = name;
+        inBeatHit = (name == 'beatHit');
+        beatCase = -1;
+        fnDepth = countChar(line, '{') - countChar(line, '}');
+        if (fnDepth <= 0) fnDepth = 1;
+        loopVar = '';
+        loopList = '';
+        loopCount = -1;
+        condActive = false;
+        condIdx = -1;
+        condTbl = '';
+        continue;
+      }
+      if (activeFn == '') continue;
+
+      // Branch-condition tracking for table-loop creations.
+      if (condActive && fnDepth < condDepth) condActive = false;
+      if (StringTools.startsWith(line, 'if (') || StringTools.startsWith(line, '} else if ('))
+      {
+        var test:Dynamic = parseTableBranchTest(line);
+        if (test != null)
+        {
+          condIdx = Std.int(util.getInt(get(test, 'col'), -1));
+          condTbl = Std.string(get(test, 'tbl'));
+          condWant = get(test, 'want') == true;
+          condActive = true;
+          condDepth = fnDepth + countChar(line, '{') - countChar(line, '}');
+          if (condDepth < fnDepth + 1) condDepth = fnDepth + 1;
+        }
+      }
+      else if (condActive && line.indexOf('} else {') >= 0)
+      {
+        condWant = !condWant;
+      }
+
+      if (inBeatHit)
+      {
+        var caseIdx:Int = line.indexOf('case ');
+        if (caseIdx >= 0)
+        {
+          var caseText:String = StringTools.trim(line.substring(caseIdx + 5));
+          var colonIdx:Int = caseText.indexOf(':');
+          var caseNumText:String = colonIdx > 0 ? StringTools.trim(caseText.substring(0, colonIdx)) : '';
+          if (isIntText(caseNumText)) beatCase = Std.parseInt(caseNumText);
+        }
+      }
+
+      if (line.indexOf('for (') == 0)
+      {
+        var lp:Int = line.indexOf('(');
+        var la:Int = line.indexOf('in', lp);
+        if (lp >= 0 && la > lp)
+        {
+          loopVar = StringTools.trim(line.substring(lp + 1, la));
+          loopList = '';
+          loopCount = -1;
+          var lRest:String = StringTools.trim(line.substring(la + 2));
+          if (lRest.indexOf('...') < 0)
+          {
+            // The header's closing paren is its LAST ')' (a list may contain
+            // calls like stage.getSprite('door1')).
+            var semi:Int = lRest.lastIndexOf(')');
+            if (semi >= 0) lRest = StringTools.trim(lRest.substring(0, semi));
+            if (get(tables, lRest) != null)
+            {
+              loopList = lRest;
+              loopCount = get(tables, lRest).length;
+            }
+            else if (StringTools.startsWith(lRest, '[') && StringTools.endsWith(lRest, ']'))
+            {
+              // 'for (a in [door1, door2])' or '[...getSprite('door1')...]'
+              // - literal actor list.
+              var listName:String = '__list_' + loopVar + '_';
+              var listItems:Array<Dynamic> = [];
+              for (li in splitTopLevel(lRest.substring(1, lRest.length - 1)))
+              {
+                var item:String = StringTools.trim(li);
+                if (item == '') continue;
+                // 'stage.getSprite('door1')' -> 'door1'
+                var gs:Int = item.indexOf("getSprite('");
+                if (gs >= 0)
+                {
+                  var gq:Int = item.indexOf("'", gs + 10);
+                  var gq2:Int = gq < 0 ? -1 : item.indexOf("'", gq + 1);
+                  if (gq2 > gq) item = item.substring(gq + 1, gq2);
+                }
+                if (item != '') listItems.push(item);
+              }
+              if (listItems.length > 0)
+              {
+                set(tables, listName, listItems);
+                loopList = listName;
+                loopCount = listItems.length;
+              }
+            }
+          }
+          else
+          {
+            var dots:Int = lRest.indexOf('...');
+            var nText:String = StringTools.trim(lRest.substring(dots + 3));
+            nText = StringTools.trim(nText.split(')')[0]);
+            if (isIntText(nText)) loopCount = Std.parseInt(nText);
+          }
+        }
+      }
+
+      extractChoreoLine(program, tables, line, activeFn, beatCase, loopVar, loopList, loopCount, condActive, condIdx, condWant, condTbl);
+      fnDepth += countChar(line, '{') - countChar(line, '}');
+      if (fnDepth <= 0) activeFn = '';
+    }
+  }
+
+  // Identifier character helpers for name scanning.
+  function isIdentChar(c:String):Bool
+  {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+  }
+
+  // The identifier immediately before a position (e.g. 'dupes' in
+  // 'dupes.push(').
+  function lastIdentifier(s:String):String
+  {
+    var t:String = StringTools.trim(s);
+    var i:Int = t.length - 1;
+    while (i >= 0 && isIdentChar(t.charAt(i))) i--;
+    return t.substring(i + 1);
+  }
+
+  // The last identifier-ish token of an expression, ignoring punctuation and
+  // digit-only tokens ('dupes[dupes.push(dupe) - 1]' -> 'dupe').
+  function lastIdentName(s:String):String
+  {
+    var t:String = StringTools.trim(s);
+    var i:Int = t.length - 1;
+    while (i >= 0 && !(isIdentChar(t.charAt(i)) && !isDigitChar(t.charAt(i)))) i--;
+    if (i < 0) return '';
+    var end:Int = i + 1;
+    while (i >= 0 && isIdentChar(t.charAt(i))) i--;
+    var name:String = t.substring(i + 1, end);
+    if (name == '') return '';
+    var allDigits:Bool = true;
+    for (c in 0...name.length)
+    {
+      var ch:String = name.charAt(c);
+      if (ch < '0' || ch > '9') allDigits = false;
+    }
+    return allDigits ? '' : name;
+  }
+
+  function isDigitChar(c:String):Bool
+  {
+    return c >= '0' && c <= '9';
+  }
+
+  // A plain identifier (no type annotations, no punctuation).
+  function isPlainIdent(s:String):Bool
+  {
+    if (s == '') return false;
+    for (i in 0...s.length)
+    {
+      var c:String = s.charAt(i);
+      if (i == 0)
+      {
+        if (!(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return false;
+      }
+      else if (!isIdentChar(c)) return false;
+    }
+    return true;
+  }
+
+  // The loop-table name before a cell access 'TBL[..][K]': skips any
+  // bracket segments between the identifier and the cell
+  // ('offsets[a][6]' -> 'offsets', 'o[6]' -> 'o').
+  function tableNameBefore(s:String, cellBracket:Int):String
+  {
+    var nameEnd:Int = cellBracket - 1;
+    var skipping:Bool = true;
+    while (skipping && nameEnd >= 0)
+    {
+      if (s.charAt(nameEnd) == ']')
+      {
+        var openB:Int = s.lastIndexOf('[', nameEnd);
+        if (openB < 0) break;
+        nameEnd = openB - 1;
+      }
+      else skipping = false;
+    }
+    var nameStart:Int = nameEnd;
+    while (nameStart >= 0 && isIdentChar(s.charAt(nameStart))) nameStart--;
+    return s.substring(nameStart + 1, nameEnd + 1);
+  }
+
+  // Parse the table/column test of a branch condition: '!o[6]',
+  // '!offsets[a][6]' or 'offsets[a][5] == 0'. Only the 'if (...)' condition
+  // is scanned, so table refs inside the statement body (tween startDelay
+  // cells, etc.) never shadow the test. Returns {tbl, col, want} or null.
+  function parseTableBranchTest(line:String):Dynamic
+  {
+    var ifOpen:Int = line.indexOf('if (');
+    if (ifOpen < 0) return null;
+    var condEnd:Int = matchCloseParen(line, ifOpen + 3);
+    if (condEnd < 0) return null;
+    var cond:String = line.substring(ifOpen + 3, condEnd);
+    var bestCol:Int = -1;
+    var bestTbl:String = '';
+    var bestBracket:Int = -1;
+    var i:Int = 0;
+    while (i < cond.length)
+    {
+      var oi:Int = cond.indexOf('[', i);
+      if (oi < 0) break;
+      var oc:Int = cond.indexOf(']', oi);
+      if (oc < 0) break;
+      var k:Int = Std.parseInt(cond.substring(oi + 1, oc));
+      if (k != null && !Math.isNaN(k))
+      {
+        var tbl:String = tableNameBefore(cond, oi);
+        if (tbl != '')
+        {
+          bestCol = k;
+          bestTbl = tbl;
+          bestBracket = oi;
+        }
+      }
+      i = oc + 1;
+    }
+    if (bestCol < 0 || bestTbl == '') return null;
+    var want:Bool = true;
+    // '!TBL[...][K]' negates the desired value.
+    var neg:Int = cond.indexOf('!');
+    if (neg >= 0 && neg < bestBracket) want = false;
+    // 'TBL[...][K] == 0' / '== false' also select the falsy rows.
+    var eqPos:Int = bestBracket > 0 ? cond.indexOf('==', bestBracket) : -1;
+    if (eqPos > bestBracket)
+    {
+      var rhs:String = StringTools.trim(cond.substring(eqPos + 2));
+      if (rhs == '0' || rhs == 'false') want = false;
+    }
+    return {tbl: bestTbl, col: bestCol, want: want};
+  }
+
+  function extractChoreoLine(program:Dynamic, tables:Dynamic, line:String, fn:String, beatCase:Int, loopVar:String, loopList:String, loopCount:Int, condActive:Bool, condIdx:Int, condWant:Bool, condTbl:String):Void
+  {
+    // ---- creation: sprites (FlxSprite/FunkinSprite) and characters ----
+    var kind:String = '';
+    var newIdx:Int = -1;
+    if (line.indexOf('new FunkinSprite(') >= 0) { newIdx = line.indexOf('new FunkinSprite('); kind = 'sprite'; }
+    else if (line.indexOf('new FlxSprite(') >= 0) { newIdx = line.indexOf('new FlxSprite('); kind = 'sprite'; }
+    else if (line.indexOf('new Character(') >= 0) { newIdx = line.indexOf('new Character('); kind = 'char'; }
+    if (newIdx >= 0)
+    {
+      var eq4:Int = line.indexOf('=');
+      if (eq4 >= 0 && eq4 < newIdx)
+      {
+        var vName:String = StringTools.trim(line.substring(0, eq4));
+        var vColon:Int = vName.indexOf(':');
+        if (vColon > 0) vName = StringTools.trim(vName.substring(0, vColon));
+        var vVar:Int = vName.indexOf('var ');
+        if (vVar >= 0) vName = StringTools.trim(vName.substring(vVar + 4));
+        var open4:Int = line.indexOf('(', newIdx);
+        var close4:Int = matchCloseParen(line, open4);
+        if (vName != '' && vName != 'if' && open4 >= 0 && close4 > open4)
+        {
+          // Nested creations ('insert(..., rompstar = new FunkinSprite(...)')
+          // leave the name embedded in an expression - keep the last token.
+          if (vName.indexOf('(') >= 0 || vName.indexOf(')') >= 0 || vName.indexOf(',') >= 0)
+          {
+            var lastComma:Int = vName.lastIndexOf(',');
+            var lastSpace:Int = vName.lastIndexOf(' ');
+            var cut:Int = lastComma > lastSpace ? lastComma : lastSpace;
+            if (cut >= 0) vName = StringTools.trim(vName.substring(cut + 1));
+          }
+          var argsText:String = line.substring(open4 + 1, close4);
+          var comma1:Int = argsText.indexOf(',');
+          var comma2:Int = comma1 < 0 ? -1 : argsText.indexOf(',', comma1 + 1);
+          var xText:String = comma1 >= 0 ? StringTools.trim(argsText.substring(0, comma1)) : '0';
+          var yText:String = comma2 >= 0 ? StringTools.trim(argsText.substring(comma1 + 1, comma2)) : '0';
+          var charId:String = '';
+          var imgArg:String = '';
+          if (kind == 'char') charId = comma2 >= 0 ? stripQuotes(StringTools.trim(argsText.substring(comma2 + 1))) : '';
+          else imgArg = StringTools.trim(argsText);
+          emitCreated(program, tables, kind, vName, xText, yText, charId, imgArg, loopVar, loopList, loopCount, condActive, condIdx, condWant);
+          // Some creations set scale inline at the end of the statement:
+          // 'insert(..., sign = new FunkinSprite(...)).scale.set(0.85, 0.85)'.
+          var ssi:Int = line.indexOf('.scale.set(', close4);
+          if (ssi > 0)
+          {
+            var sso2:Int = line.indexOf('(', ssi);
+            var ssc2:Int = line.indexOf(')', sso2);
+            if (sso2 >= 0 && ssc2 > sso2)
+            {
+              var sp2:Array<String> = splitTopLevel(line.substring(sso2 + 1, ssc2));
+              if (sp2.length >= 1) applyChoreoAttr(program, tables, vName, 'scaleX', StringTools.trim(sp2[0]), loopVar, loopList, loopCount);
+              if (sp2.length >= 2) applyChoreoAttr(program, tables, vName, 'scaleY', StringTools.trim(sp2[1]), loopVar, loopList, loopCount);
+            }
+          }
+        }
+      }
+    }
+
+    // ---- per-created attributes ----
+    var eq5:Int = line.indexOf('=');
+    var dot5:Int = line.indexOf('.');
+    if (dot5 > 0 && eq5 > dot5)
+    {
+      var attrTarget:String = StringTools.trim(line.substring(0, dot5));
+      var attrName:String = StringTools.trim(line.substring(dot5 + 1, eq5));
+      var attrValue:String = StringTools.trim(line.substring(eq5 + 1));
+      if (StringTools.endsWith(attrValue, ';')) attrValue = StringTools.trim(attrValue.substring(0, attrValue.length - 1));
+      if (attrName == 'visible' || attrName == 'flipX' || attrName == 'antialiasing' || attrName == 'alpha' || attrName == 'x' || attrName == 'y')
+        applyChoreoAttr(program, tables, attrTarget, attrName, attrValue, loopVar, loopList, loopCount);
+      else if (StringTools.startsWith(attrName, 'scale'))
+        applyChoreoAttr(program, tables, attrTarget, 'scaleX', attrValue, loopVar, loopList, loopCount);
+    }
+    // scale.set(a, b)
+    var ssIdx:Int = line.indexOf('.scale.set(');
+    if (ssIdx > 0)
+    {
+      var sso:Int = line.indexOf('(', ssIdx);
+      var ssc:Int = line.indexOf(')', sso);
+      if (sso >= 0 && ssc > sso)
+      {
+        var sParts:Array<String> = splitTopLevel(line.substring(sso + 1, ssc));
+        if (sParts.length >= 1) applyChoreoAttr(program, tables, StringTools.trim(line.substring(0, ssIdx)), 'scaleX', StringTools.trim(sParts[0]), loopVar, loopList, loopCount);
+        if (sParts.length >= 2) applyChoreoAttr(program, tables, StringTools.trim(line.substring(0, ssIdx)), 'scaleY', StringTools.trim(sParts[1]), loopVar, loopList, loopCount);
+      }
+    }
+    // frames = Paths.getSparrowAtlas('...')
+    var atIdx:Int = line.indexOf('.frames = Paths.getSparrowAtlas(');
+    if (atIdx > 0)
+    {
+      var atlasName:String = extractPathCall(line, 'getSparrowAtlas(');
+      if (atlasName != '') applyChoreoAttr(program, tables, StringTools.trim(line.substring(0, atIdx)), 'atlas', atlasName, loopVar, loopList, loopCount);
+    }
+    // addAnim('name', 'prefix', fps, loop...)
+    var animIdx:Int = line.indexOf('.addAnim(');
+    if (animIdx > 0)
+    {
+      var animTarget:String = StringTools.trim(line.substring(0, animIdx));
+      var ao:Int = line.indexOf('(', animIdx);
+      if (ao >= 0)
+      {
+        var aParts:Array<String> = splitTopLevel(line.substring(ao + 1, line.lastIndexOf(')')));
+        if (aParts.length >= 2)
+        {
+          var animName:String = stripQuotes(StringTools.trim(aParts[0]));
+          var animPrefix:String = stripQuotes(StringTools.trim(aParts[1]));
+          var animFps:Float = aParts.length > 2 ? Std.parseFloat(StringTools.trim(aParts[2])) : 24;
+          if (Math.isNaN(animFps) || animFps <= 0) animFps = 24;
+          applyChoreoAnim(program, tables, animTarget, animName, animPrefix, animFps, loopVar, loopList, loopCount);
+        }
+      }
+    }
+
+    // ---- insertion order: insert(members.indexOf(stage.getSprite('P')) + N, NAME) ----
+    var insIdx:Int = line.indexOf('stage.getSprite(');
+    if (insIdx >= 0)
+    {
+      var s2:Int = line.indexOf("'", insIdx);
+      var e2:Int = s2 < 0 ? -1 : line.indexOf("'", s2 + 1);
+      if (e2 > s2)
+      {
+        var beforeProp:String = line.substring(s2 + 1, e2);
+        var zParsed:Int = 2;
+        var plusIdx:Int = line.indexOf('+', e2);
+        if (plusIdx >= 0)
+        {
+          var zText2:String = '';
+          var cIdx:Int = plusIdx + 1;
+          while (cIdx < line.length && line.charCodeAt(cIdx) == 32) cIdx++;
+          while (cIdx < line.length && line.charCodeAt(cIdx) >= 48 && line.charCodeAt(cIdx) <= 57) { zText2 += line.charAt(cIdx); cIdx++; }
+          if (zText2 != '') zParsed = Std.parseInt(zText2);
+        }
+        // The inserted actor is either the trailing name of the insert call
+        // ('insert(..., name)') or, for nested creations
+        // ('insert(..., dupe = new Character(...))'), the identifier right
+        // before the '='.
+        var candidates:Array<String> = [];
+        var rev:Int = line.lastIndexOf(',');
+        if (rev >= 0)
+        {
+          var tail:String = StringTools.trim(line.substring(rev + 1));
+          tail = StringTools.trim(tail.split(')')[0]);
+          var colonI:Int = tail.indexOf(':');
+          if (colonI > 0) tail = StringTools.trim(tail.substring(colonI + 1));
+          if (tail != '') candidates.push(tail);
+        }
+        var eqI2:Int = line.indexOf('=');
+        if (eqI2 > 0)
+        {
+          var commaBefore:Int = line.lastIndexOf(',', eqI2);
+          if (commaBefore >= 0)
+          {
+            var preEq:String = StringTools.trim(line.substring(commaBefore + 1, eqI2));
+            if (preEq != '' && candidates.indexOf(preEq) == -1) candidates.push(preEq);
+          }
+        }
+        for (cand in candidates)
+        {
+          var hit:Dynamic = null;
+          findChoreoRefs(program, tables, cand, loopVar, loopList, loopCount, function(r:Dynamic):Void
+          {
+            set(r, 'before', beforeProp);
+            set(r, 'z', zParsed);
+            hit = r;
+          });
+          if (hit != null) break;
+        }
+      }
+    }
+
+    // ---- array membership ----
+    // 'arr.push(actor)' (also 'arr[arr.push(actor) - 1]' nested inside another
+    // push): record which runtime arrays hold loop-created actors, so the
+    // runtime can expand 'arr[a]' loop-var targets onto the right group.
+    var ps:Int = 0;
+    while (line.indexOf('.push(', ps) >= 0)
+    {
+      var pIdx:Int = line.indexOf('.push(', ps);
+      // The '(' sits right after the 5-char '.push' marker; a nested push call
+      // can sit between the parens ('characters.push(dupes[dupes.push(dupe) - 1])').
+      var pc:Int = matchCloseParen(line, pIdx + 5);
+      if (pc < 0) break;
+      var argText:String = StringTools.trim(line.substring(pIdx + 6, pc));
+      var recv:String = lastIdentifier(line.substring(0, pIdx));
+      var pushed:String = lastIdentName(argText);
+      if (recv != '' && pushed != '' && recv != 'null' && pushed != 'null')
+      {
+        var pushedRefs:Array<Dynamic> = choreoRefsNamed(program, pushed, loopVar, loopList, loopCount);
+        for (pr in pushedRefs)
+        {
+          if (pr == null) continue;
+          var groups:Array<Dynamic> = get(pr, 'groups');
+          if (groups == null)
+          {
+            groups = [];
+            set(pr, 'groups', groups);
+          }
+          if (groups.indexOf(recv) < 0) groups.push(recv);
+        }
+      }
+      // Continue INSIDE the call too, so a nested push
+      // ('arr[arr.push(x) - 1]') is visited as well.
+      ps = pIdx + 6;
+    }
+
+    // ---- beat ops ----
+    if (beatCase >= 0)
+    {
+      var vDot:Int = line.indexOf('.visible');
+      if (vDot > 0 && line.indexOf('=') > vDot)
+      {
+        var eqV:Int = line.indexOf('=', vDot);
+        var valV:String = StringTools.trim(line.substring(eqV + 1));
+        valV = StringTools.trim(valV.split(';')[0]);
+        if (valV == 'true' || valV == 'false')
+          addBeatOp(program, beatCase, resolveLoopTarget(line.substring(0, vDot), loopVar, loopList, loopCount), 'visible', valV == 'true');
+      }
+      var fDot:Int = line.indexOf('.flipX');
+      if (fDot > 0 && line.indexOf('=') > fDot)
+      {
+        var eqF:Int = line.indexOf('=', fDot);
+        var valF:String = StringTools.trim(line.substring(eqF + 1));
+        valF = StringTools.trim(valF.split(';')[0]);
+        if (valF == 'true' || valF == 'false')
+          addBeatOp(program, beatCase, resolveLoopTarget(line.substring(0, fDot), loopVar, loopList, loopCount), 'flipX', valF == 'true');
+      }
+      if (line.indexOf('.swapLeftRightAnimations()') >= 0)
+        addBeatOp(program, beatCase, resolveLoopTarget(line.substring(0, line.indexOf('.swap')), loopVar, loopList, loopCount), 'swapLR', true);
+      // (the finishCallback line's inner playAnim is captured separately as
+      // a 'nextAnim' op - skip it here so it isn't double-captured).
+      var paIdx:Int = line.indexOf('.playAnim(');
+      if (paIdx > 0 && line.indexOf('.animation.finishCallback') < 0)
+      {
+        var pao:Int = line.indexOf('(', paIdx);
+        var pac:Int = line.indexOf(')', pao);
+        if (pao >= 0 && pac > pao)
+        {
+          var paAnim:String = StringTools.trim(line.substring(pao + 1, pac));
+          if (paAnim.length >= 2 && paAnim.charAt(0) == "'" && paAnim.charAt(paAnim.length - 1) == "'")
+            addBeatOp(program, beatCase, resolveLoopTarget(line.substring(0, paIdx), loopVar, loopList, loopCount), 'playAnim', stripQuotes(paAnim));
+        }
+      }
+      if (line.indexOf('FlxTween.tween(') >= 0) extractChoreoTween(program, tables, line, beatCase, loopVar, loopList, loopCount, condActive, condIdx, condWant, condTbl);
+    }
+
+    // ---- sequential animation on completion ----
+    // 'target.animation.finishCallback = () -> target.playAnim('next')'
+    // (Codename plays a follow-up animation when the current, non-looping
+    // one ends - e.g. madstage's inv -> shake). Emitted as a 'nextAnim' op
+    // so the runtime attaches the completion hook after the paired playAnim.
+    var fcIdx:Int = line.indexOf('.animation.finishCallback');
+    if (fcIdx > 0)
+    {
+      var fcTarget:String = StringTools.trim(line.substring(0, fcIdx));
+      var fcPlay:Int = fcIdx > 0 ? line.indexOf('.playAnim(', fcIdx) : -1;
+      if (fcPlay > 0)
+      {
+        var fcOpen:Int = line.indexOf('(', fcPlay);
+        var fcClose:Int = fcOpen < 0 ? -1 : line.indexOf(')', fcOpen);
+        if (fcClose > fcOpen)
+        {
+          var fcAnimRaw:String = StringTools.trim(line.substring(fcOpen + 1, fcClose));
+          if (fcAnimRaw.length >= 2 && fcAnimRaw.charAt(0) == "'" && fcAnimRaw.charAt(fcAnimRaw.length - 1) == "'")
+          {
+            var fcAnim:String = stripQuotes(fcAnimRaw);
+            var fcResolved:String = resolveLoopTarget(fcTarget, loopVar, loopList, loopCount);
+            if (beatCase >= 0) addBeatOp(program, beatCase, fcResolved, 'nextAnim', fcAnim);
+            else if (fn != '' && fn != 'create' && fn != 'postCreate' && fn != 'beatHit' && fn != 'onEvent' && fn != 'update') addCallOp(program, fn, fcResolved, 'nextAnim', fcAnim);
+          }
+        }
+      }
+    }
+
+    // ---- camera event-driven playAnim (stage onEvent) ----
+    if (fn == 'onEvent' && line.indexOf('.playAnim(') > 0)
+    {
+      var tIdx:Int = line.indexOf('.playAnim(');
+      var tOpen:Int = line.indexOf('(', tIdx);
+      var tClose:Int = line.indexOf(')', tOpen);
+      if (tClose > tOpen)
+      {
+        var args3:String = line.substring(tOpen + 1, tClose);
+        var qIdx:Int = args3.indexOf('?');
+        var colonT:Int = args3.indexOf(':', qIdx);
+        if (qIdx >= 0 && colonT > qIdx)
+        {
+          // Ternary 'COND ? TRUE : FALSE' - the TRUE branch is BETWEEN the
+          // '?' and ':', the FALSE branch after the ':'.
+          var animTrue:String = stripQuotes(StringTools.trim(args3.substring(qIdx + 1, colonT)));
+          var animFalse:String = stripQuotes(StringTools.trim(args3.substring(colonT + 1)));
+          var evTarget:String = StringTools.trim(line.substring(0, tIdx));
+          // The common guard is 'e.event.params[0] != 0': camera line 0
+          // (opponent) takes the FALSE branch, every other line the TRUE one.
+          if (animFalse != '') get(program, 'camAnims').push({param: 0, target: evTarget, anim: animFalse});
+          if (animTrue != '') get(program, 'camAnims').push({param: -1, target: evTarget, anim: animTrue});
+        }
+      }
+    }
+
+    // ---- call bodies (HScript Call playback) ----
+    if (fn != '' && fn != 'create' && fn != 'postCreate' && fn != 'beatHit' && fn != 'onEvent' && fn != 'update')
+    {
+      var cDot:Int = line.indexOf('.visible');
+      if (cDot > 0 && line.indexOf('=') > cDot)
+      {
+        var eqC:Int = line.indexOf('=', cDot);
+        var valC:String = StringTools.trim(line.substring(eqC + 1));
+        valC = StringTools.trim(valC.split(';')[0]);
+        if (valC == 'true' || valC == 'false')
+          addCallOp(program, fn, StringTools.trim(line.substring(0, cDot)), 'visible', valC == 'true');
+      }
+      var gIdx:Int = line.indexOf('.playAnim(');
+      if (gIdx > 0 && line.indexOf('.animation.finishCallback') < 0)
+      {
+        var go:Int = line.indexOf('(', gIdx);
+        var gc:Int = line.indexOf(')', go);
+        if (go >= 0 && gc > go)
+        {
+          var animG:String = StringTools.trim(line.substring(go + 1, gc));
+          if (animG.length >= 2 && animG.charAt(0) == "'" && animG.charAt(animG.length - 1) == "'")
+            addCallOp(program, fn, StringTools.trim(line.substring(0, gIdx)), 'playAnim', stripQuotes(animG));
+        }
+      }
+    }
+  }
+
+  // The paren matching an opening paren (depth scan), or -1.
+  function matchCloseParen(s:String, open:Int):Int
+  {
+    if (open < 0) return -1;
+    var depth:Int = 0;
+    for (i in open...s.length)
+    {
+      var c:String = s.charAt(i);
+      if (c == '(') depth++;
+      else if (c == ')')
+      {
+        depth--;
+        if (depth == 0) return i;
+      }
+    }
+    return -1;
+  }
+
+  // Create one program instance per loop iteration (or one when no loop).
+  function emitCreated(program:Dynamic, tables:Dynamic, kind:String, vName:String, xText:String, yText:String, charId:String, imgArg:String, loopVar:String, loopList:String, loopCount:Int, condActive:Bool, condIdx:Int, condWant:Bool):Void
+  {
+    var count:Int = loopCount > 0 ? loopCount : 1;
+    var emitted:Int = 0;
+    for (i in 0...count)
+    {
+      var entry:Dynamic = loopList != '' && loopList != 'null' ? get(tables, loopList)[i] : null;
+      // Only entries matching the enclosing 'if (!o[K])' / 'else' branch.
+      if (condActive && condIdx >= 0)
+      {
+        if (entry == null) continue;
+        var bit:Dynamic = entry[condIdx];
+        var isTrue:Bool = bit == true || bit == 1;
+        if (isTrue != condWant) continue;
+      }
+      var xPos:Dynamic = evalChoreoPos(xText, entry, tables);
+      var yPos:Dynamic = evalChoreoPos(yText, entry, tables);
+      var instance:Dynamic = null;
+      if (kind == 'char')
+      {
+        instance = {name: vName, charId: charId, x: util.getFloat(get(xPos, 'off'), 0), y: util.getFloat(get(yPos, 'off'), 0), xRef: Std.string(get(xPos, 'ref')), visible: true, flipX: false, scaleX: 1, scaleY: 1, antialias: true, before: '', z: 150};
+        get(program, 'characters').push(instance);
+      }
+      else
+      {
+        instance = {name: vName, x: util.getFloat(get(xPos, 'off'), 0), y: util.getFloat(get(yPos, 'off'), 0), xRef: Std.string(get(xPos, 'ref')), img: evalChoreoImg(imgArg, entry), atlas: '', anims: [], visible: true, flipX: false, scaleX: 1, scaleY: 1, antialias: true, before: '', z: 150};
+        get(program, 'sprites').push(instance);
+      }
+      if (count > 1)
+      {
+        // Loop-expanded instances are addressable by base name AND by their
+        // linear creation order; scripts index loop-created actors through
+        // arrays ('for (a in 0...dupes.length) dupes[a].visible = true'),
+        // and creation order matches the script's push order.
+        set(instance, 'name', vName + emitted);
+        set(instance, 'ord', emitted);
+        set(instance, 'fromLoop', true);
+        // The loop-table row this instance was created from; per-entry tween
+        // values and delays read their own row through it at runtime.
+        set(instance, 'loopIdx', i);
+      }
+      set(instance, 'base', vName);
+      get(program, 'order').push(instance);
+      emitted++;
+    }
+  }
+
+  // Apply an attribute to every created instance matching the target name.
+  function applyChoreoAttr(program:Dynamic, tables:Dynamic, target:String, attr:String, value:String, loopVar:String, loopList:String, loopCount:Int):Void
+  {
+    if (target == '') return;
+    var refs:Array<Dynamic> = choreoRefsNamed(program, target, loopVar, loopList, loopCount);
+    for (r in refs)
+    {
+      if (r == null) continue;
+      if (attr == 'visible') set(r, 'visible', value == 'true');
+      else if (attr == 'flipX')
+      {
+        if (value == 'true') set(r, 'flipX', true);
+        else if (value == 'false') set(r, 'flipX', false);
+        else if (value.indexOf('!') >= 0)
+        {
+          // '!o[4]' style: evaluate against the table entry when possible.
+          var idxOpen:Int = value.indexOf('[');
+          var idxClose:Int = value.indexOf(']', idxOpen);
+          var k:Int = idxOpen >= 0 && idxClose > idxOpen ? Std.parseInt(value.substring(idxOpen + 1, idxClose)) : -1;
+          if (k >= 0 && loopList != '')
+          {
+            // Evaluate against the instance's OWN table row (loopIdx), not
+            // the first entry - each loop-created actor mirrors per its row.
+            var rowIdx:Int = Std.int(util.getFloat(get(r, 'loopIdx'), 0));
+            var entry:Dynamic = get(tables, loopList)[rowIdx];
+            if (entry != null)
+            {
+              var bit:Dynamic = util.getBool(entry[k], false);
+              set(r, 'flipX', !bit);
+            }
+          }
+        }
+      }
+      else if (attr == 'antialiasing') set(r, 'antialias', boolVal(value));
+      else if (attr == 'alpha') set(r, 'alpha', Std.parseFloat(value));
+      else if (attr == 'scaleX')
+      {
+        var sv:Float = Std.parseFloat(value);
+        if (!Math.isNaN(sv)) set(r, 'scaleX', sv);
+      }
+      else if (attr == 'scaleY')
+      {
+        var sv2:Float = Std.parseFloat(value);
+        if (!Math.isNaN(sv2)) set(r, 'scaleY', sv2);
+      }
+      else if (attr == 'atlas') set(r, 'atlas', value);
+    }
+  }
+
+  // Parse a boolean attribute value, honoring '!': '!(sign.visible = false)'
+  // reads the inner assignment's value (false) and negates it (true).
+  function boolVal(v:String):Bool
+  {
+    var t:String = StringTools.trim(v);
+    var neg:Bool = t.indexOf('!') >= 0;
+    var base:Bool = t == 'true';
+    if (t.indexOf('true') >= 0) base = true;
+    else if (t.indexOf('false') >= 0) base = false;
+    return neg ? !base : base;
+  }
+
+  function applyChoreoAnim(program:Dynamic, tables:Dynamic, target:String, animName:String, prefix:String, fps:Float, loopVar:String, loopList:String, loopCount:Int):Void
+  {
+    if (animName == '' || prefix == '') return;
+    var refs:Array<Dynamic> = choreoRefsNamed(program, target, loopVar, loopList, loopCount);
+    for (r in refs)
+    {
+      if (r == null) continue;
+      var anims:Array<Dynamic> = get(r, 'anims');
+      if (anims == null) continue;
+      var dup:Bool = false;
+      for (existing in anims)
+      {
+        if (existing != null && Std.string(get(existing, 'name')) == animName) dup = true;
+      }
+      if (!dup) anims.push({name: animName, prefix: prefix, fps: fps, loop: false});
+    }
+  }
+
+  // Instances matching a target name (with loop-expansion).
+  function choreoRefsNamed(program:Dynamic, target:String, loopVar:String, loopList:String, loopCount:Int):Array<Dynamic>
+  {
+    var result:Array<Dynamic> = [];
+    var order:Array<Dynamic> = get(program, 'order');
+    if (order == null) return result;
+    for (r in order)
+    {
+      if (r == null) continue;
+      if (Std.string(get(r, 'name')) == target || Std.string(get(r, 'base')) == target) result.push(r);
+    }
+    return result;
+  }
+
+  function findChoreoRefs(program:Dynamic, tables:Dynamic, target:String, loopVar:String, loopList:String, loopCount:Int, cb:Dynamic):Void
+  {
+    var refs:Array<Dynamic> = choreoRefsNamed(program, target, loopVar, loopList, loopCount);
+    for (r in refs)
+    {
+      if (r != null) cb(r);
+    }
+  }
+
+  function resolveLoopTarget(rawTarget:String, loopVar:String, loopList:String, loopCount:Int):String
+  {
+    var t:String = StringTools.trim(rawTarget);
+    if (t == '') return '';
+    // 'arr[i]' where i is the current loop counter -> per-entry address that
+    // the runtime maps onto the ordered created instances.
+    var br:Int = t.indexOf('[');
+    if (br > 0 && t.indexOf(']') > br)
+    {
+      var idxText:String = StringTools.trim(t.substring(br + 1, t.indexOf(']', br)));
+      if (idxText == loopVar && loopCount > 0)
+      {
+        // Keep the bracket form; the runtime resolves 'base[i]' by order.
+        return t;
+      }
+      var idxNum:Int = idxText != '' ? Std.parseInt(idxText) : -1;
+      if (idxNum >= 0) return t;
+    }
+    return t;
+  }
+
+  function addBeatOp(program:Dynamic, beat:Int, target:String, op:String, value:Dynamic):Void
+  {
+    if (target == '' || target == 'null') return;
+    var beats:Array<Dynamic> = get(program, 'beats');
+    var entry:Dynamic = null;
+    for (b in beats)
+    {
+      if (b != null && Std.int(util.getFloat(get(b, 'beat'), -1)) == beat) entry = b;
+    }
+    if (entry == null)
+    {
+      entry = {beat: beat, ops: []};
+      beats.push(entry);
+    }
+    get(entry, 'ops').push({target: target, op: op, value: value});
+  }
+
+  // Expand a loop-variable target onto its concrete actors (a literal list
+  // like 'for (a in [door1, door2])'), emitting one op per actor.
+  function addBeatOpLoop(program:Dynamic, beat:Int, target:String, op:String, value:Dynamic, loopVar:String, loopList:String, tables:Dynamic):Void
+  {
+    if (target == loopVar && loopList != '' && StringTools.startsWith(loopList, '__list_'))
+    {
+      var items:Array<Dynamic> = get(tables, loopList);
+      if (items != null)
+      {
+        for (item in items)
+        {
+          var name:String = Std.string(item);
+          if (name != '' ) addBeatOp(program, beat, name, op, value);
+        }
+        return;
+      }
+    }
+    addBeatOp(program, beat, target, op, value);
+  }
+
+  function addCallOp(program:Dynamic, fn:String, target:String, op:String, value:Dynamic):Void
+  {
+    if (target == '') return;
+    var calls:Dynamic = get(program, 'calls');
+    var ops:Array<Dynamic> = get(calls, fn);
+    if (ops == null)
+    {
+      ops = [];
+      set(calls, fn, ops);
+    }
+    ops.push({target: target, op: op, value: value});
+  }
+
+  // Loosely parse a constant nested array: [[-500,100,...],[...]].
+  function parseConstTable(src:String):Array<Dynamic>
+  {
+    var result:Array<Dynamic> = [];
+    var stack:Array<Dynamic> = [];
+    var token:String = '';
+    try
+    {
+      for (i in 0...src.length)
+      {
+        var c:String = src.charAt(i);
+        if (c == '[')
+        {
+          // A pending token gluing to the bracket (line joins can attach a
+          // comment to the following row) must be flushed BEFORE opening the
+          // new row, or it swallows the row's first value.
+          var pre:String = StringTools.trim(token);
+          token = '';
+          if (pre != '' && stack.length > 0)
+          {
+            var pv:Dynamic = constTableValue(pre);
+            if (pv != null) stack[stack.length - 1].push(pv);
+          }
+          stack.push([]);
+        }
+        else if (c == ']' || c == ',')
+        {
+          var tt:String = StringTools.trim(token);
+          token = '';
+          if (tt != '' && stack.length > 0)
+          {
+            var val:Dynamic = constTableValue(tt);
+            if (val != null) stack[stack.length - 1].push(val);
+          }
+          if (c == ']' && stack.length > 0)
+          {
+            var row:Dynamic = stack.pop();
+            if (stack.length > 0) stack[stack.length - 1].push(row);
+            else result.push(row);
+          }
+        }
+        else token += c;
+      }
+    }
+    catch (e:Dynamic)
+    {
+      return null;
+    }
+    // A top-level '[ [...] ]' yields a single wrapper array holding the
+    // rows; callers expect the row list itself, so unwrap it.
+    if (result.length == 1 && Std.isOfType(result[0], Array))
+    {
+      var child:Array<Dynamic> = result[0];
+      var rowsOnly:Bool = child.length > 0;
+      for (r in child)
+      {
+        if (r == null || !Std.isOfType(r, Array)) rowsOnly = false;
+      }
+      if (rowsOnly) result = child;
+    }
+    return result.length > 0 ? result : null;
+  }
+
+  function constTableValue(tt:String):Dynamic
+  {
+    if (tt == 'true') return true;
+    if (tt == 'false') return false;
+    var n:Float = Std.parseFloat(tt);
+    if (!Math.isNaN(n)) return n;
+    return null;
+  }
+
+  // Evaluate a choreography position expression to {off, ref}.
+  function evalChoreoPos(text:String, entry:Dynamic, tables:Dynamic):Dynamic
+  {
+    var result:Dynamic = {off: 0.0, ref: ''};
+    var t:String = StringTools.trim(text);
+    if (t == '' || t == 'null') return result;
+    // '<ref>.x + <rest>' (runtime-relative, e.g. 'dad.x + o[0]')
+    var dotPos:Int = t.indexOf('.x');
+    if (dotPos > 0)
+    {
+      var refName:String = StringTools.trim(t.substring(0, dotPos));
+      var rest:String = StringTools.trim(t.substring(dotPos + 2));
+      var rp:Int = rest.indexOf('+');
+      if (rp >= 0) rest = StringTools.trim(rest.substring(rp + 1));
+      set(result, 'ref', refName);
+      var off:Float = valChoreoToken(rest, entry);
+      if (!Math.isNaN(off)) set(result, 'off', off);
+      return result;
+    }
+    var num:Float = valChoreoToken(t, entry);
+    if (!Math.isNaN(num)) set(result, 'off', num);
+    return result;
+  }
+
+  // One numeric token: plain number or 'NAME[K]' ('o[K]') reading the loop
+  // table entry (the prefix is the loop variable name, e.g. 'o').
+  function valChoreoToken(t:String, entry:Dynamic):Float
+  {
+    t = StringTools.trim(t);
+    if (t == '') return Math.NaN;
+    var n:Float = Std.parseFloat(t);
+    if (!Math.isNaN(n)) return n;
+    var oi:Int = t.indexOf('[');
+    if (oi >= 0)
+    {
+      var oc:Int = t.indexOf(']', oi);
+      var k:Int = oc > oi ? Std.parseInt(t.substring(oi + 1, oc)) : -1;
+      if (k >= 0 && entry != null)
+      {
+        var v:Dynamic = entry[k];
+        if (v != null && (Std.isOfType(v, Float) || Std.isOfType(v, Int))) return v;
+        if (v == true) return 1;
+      }
+    }
+    return Math.NaN;
+  }
+
+  // Evaluate a Paths.image(...) argument: literal or `base' + (o[K] ? 'A' : '')`.
+  function evalChoreoImg(imgArg:String, entry:Dynamic):String
+  {
+    var t:String = StringTools.trim(imgArg);
+    if (t == '') return '';
+    var imgName:String = extractPathCall(t, 'Paths.image(');
+    if (imgName == '') return '';
+    var q:Int = imgName.indexOf("'");
+    var base:String = '';
+    var condRest:String = '';
+    if (q >= 0)
+    {
+      var q2:Int = imgName.indexOf("'", q + 1);
+      if (q2 > q) base = imgName.substring(q + 1, q2);
+      condRest = StringTools.trim(imgName.substring(q2 + 1));
+    }
+    else
+    {
+      base = imgName;
+    }
+    var condA:String = '';
+    var condB:String = '';
+    var condIdx:Int = -1;
+    var qm:Int = condRest.indexOf('?');
+    var cl:Int = condRest.indexOf(':');
+    if (qm >= 0 && cl > qm)
+    {
+      var skip:Int = condRest.indexOf('[');
+      if (skip >= 0 && skip < qm)
+      {
+        var cl2:Int = condRest.indexOf(']', skip);
+        if (cl2 > skip) condIdx = Std.parseInt(condRest.substring(skip + 1, cl2));
+      }
+      condA = stripQuotes(StringTools.trim(condRest.substring(qm + 1, cl)));
+      condB = stripQuotes(StringTools.trim(condRest.substring(cl + 1)));
+    }
+    var useAlt:Bool = false;
+    if (condIdx >= 0 && entry != null)
+    {
+      var cv:Dynamic = entry[condIdx];
+      useAlt = cv == true || cv == 1;
+    }
+    if (condA != '' || condB != '')
+    {
+      return base + (useAlt ? condA : condB);
+    }
+    return base;
+  }
+
+  // Split a string on top-level commas (ignoring brackets/quotes).
+  function splitTopLevel(s:String):Array<String>
+  {
+    var parts:Array<String> = [];
+    var depth:Int = 0;
+    var cur:String = '';
+    var quote:String = '';
+    for (i in 0...s.length)
+    {
+      var c:String = s.charAt(i);
+      if (quote != '')
+      {
+        cur += c;
+        if (c == quote) quote = '';
+        continue;
+      }
+      if (c == "'" || c == '"') { quote = c; cur += c; continue; }
+      if (c == '[' || c == '{' || c == '(') depth++;
+      else if (c == ']' || c == '}' || c == ')') depth--;
+      if (c == ',' && depth == 0)
+      {
+        parts.push(cur);
+        cur = '';
+      }
+      else cur += c;
+    }
+    parts.push(cur);
+    return parts;
+  }
+
+  function isIntText(t:String):Bool
+  {
+    if (t == '' || t == null) return false;
+    for (i in 0...t.length)
+    {
+      var c:String = t.charAt(i);
+      if (c < '0' || c > '9') return false;
+    }
+    return true;
+  }
+
+  // Tween extraction for a beat-case line.
+  function extractChoreoTween(program:Dynamic, tables:Dynamic, line:String, beatCase:Int, loopVar:String, loopList:String, loopCount:Int, condActive:Bool, condIdx:Int, condWant:Bool, condTbl:String):Void
+  {
+    // Inline completion lambdas ('onComplete: function(_) {') leave the paren
+    // balance open on the same line (the lambda body closes on later lines);
+    // the callback body is not portable, so close both the options object and
+    // the tween call at the lambda and parse only the header before it.
+    var workLine:String = line;
+    var ocIdx:Int = workLine.indexOf('onComplete:');
+    if (ocIdx >= 0) workLine = workLine.substring(0, ocIdx) + '})';
+    var callIdx:Int = workLine.indexOf('FlxTween.tween(');
+    var open:Int = callIdx + 'FlxTween.tween('.length - 1;
+    var close:Int = matchCloseParen(workLine, open);
+    if (open < 0 || close <= open) return;
+    var args:String = workLine.substring(open + 1, close);
+    var parts:Array<String> = splitTopLevel(args);
+    if (parts.length < 3) return;
+    var targetText:String = StringTools.trim(parts[0]);
+    var fieldsText:String = StringTools.trim(parts[1]);
+    var durText:String = StringTools.trim(parts[2]);
+    var optsText:String = parts.length > 3 ? StringTools.trim(parts[3]) : '';
+    var ease:String = attrFromObj(optsText, 'ease');
+    // FlxEase symbols come through verbatim ('FlxEase.cubeOut' or 'cubeOut');
+    // the runtime resolves them against FlxEase directly.
+    var fx:Int = ease.indexOf('FlxEase.');
+    if (fx >= 0) ease = ease.substring(fx + 8);
+    var delay:Float = numFromObj(optsText, 'startDelay', 0);
+    // Per-entry start delays: 'startDelay: offsets[a][5]'.
+    var delayTbl:String = '';
+    var delayCol:Int = -1;
+    var delayRef:Dynamic = parseTweenRefExpr(attrFromObj(optsText, 'startDelay'), loopVar, tables);
+    if (delayRef != null)
+    {
+      delayTbl = Std.string(get(delayRef, 'tbl'));
+      delayCol = Std.int(util.getFloat(get(delayRef, 'col'), -1));
+    }
+    // Per-entry branch predicate: 'if (!offsets[a][6]) FlxTween.tween(...)'.
+    var condTbl2:String = '';
+    if (condActive && condIdx >= 0 && loopVar != '' && loopVar != 'null' && condTbl != '') condTbl2 = condTbl;
+
+    // Scale-target tweens: 'FlxTween.tween(dupes[a].scale, {x: 1, y: 1}, ...)'.
+    var scaleTarget:Bool = false;
+    if (StringTools.endsWith(targetText, '.scale'))
+    {
+      scaleTarget = true;
+      targetText = StringTools.trim(targetText.substring(0, targetText.length - 6));
+    }
+
+    var fLo:Int = fieldsText.indexOf('{');
+    var fHi:Int = fieldsText.lastIndexOf('}');
+    if (fLo < 0 || fHi <= fLo) return;
+    var fieldParts:Array<String> = splitTopLevel(fieldsText.substring(fLo + 1, fHi));
+
+    var targets:Array<String> = [];
+    var targetDurs:Array<Float> = [];
+    // '[bf, gf][a]' with the loop variable as index: one target per entry.
+    if (targetText.indexOf('[') == 0)
+    {
+      var br:Int = targetText.indexOf(']');
+      var listCore:String = StringTools.trim(targetText.substring(1, br));
+      var idxExpr:String = StringTools.trim(targetText.substring(br + 2, targetText.length - 1));
+      var items:Array<String> = listCore.split(',');
+      var iCount:Int = items.length;
+      for (li in 0...iCount)
+      {
+        targets.push(StringTools.trim(items[li]));
+      }
+      if (idxExpr == loopVar && loopCount > 0) iCount = loopCount;
+      // per-entry durations: '[3.167, 2.6][a]'
+      var durList:Array<Float> = [];
+      if (durText.indexOf('[') >= 0)
+      {
+        var dInner:String = StringTools.trim(durText.substring(1, durText.indexOf(']')));
+        for (dp in dInner.split(','))
+        {
+          var dv:Float = Std.parseFloat(StringTools.trim(dp));
+          if (Math.isNaN(dv)) dv = 1;
+          durList.push(dv);
+        }
+      }
+      for (ti in 0...targets.length)
+      {
+        var perDur:Float = Std.parseFloat(durText);
+        if (Math.isNaN(perDur))
+        {
+          perDur = durList.length > ti ? durList[ti] : 1;
+        }
+        targetDurs.push(perDur);
+      }
+    }
+    else
+    {
+      targets.push(resolveLoopTarget(targetText, loopVar, loopList, loopCount));
+      var durN:Float = Std.parseFloat(durText);
+      if (Math.isNaN(durN)) durN = 1;
+      targetDurs.push(durN);
+    }
+
+    for (ti in 0...targets.length)
+    {
+      var target:String = targets[ti];
+      if (target == '') continue;
+      var dur:Float = targetDurs[ti];
+      for (fp in fieldParts)
+      {
+        var eqF:Int = fp.indexOf(':');
+        if (eqF < 0) continue;
+        var fieldName:String = StringTools.trim(fp.substring(0, eqF));
+        var fieldExpr:String = StringTools.trim(fp.substring(eqF + 1));
+        // Runtime-relative, table-driven values: 'dad.y + offsets[a][3]' (and
+        // bare 'offsets[a][K]' cells) are emitted as tweenRef ops so the
+        // runtime can resolve each actor's own row.
+        var delta:Float = exprDelta(fieldExpr);
+        var refVal:Dynamic = parseTweenRefExpr(fieldExpr, loopVar, tables);
+        if (scaleTarget && (fieldName == 'x' || fieldName == 'y'))
+        {
+          if (refVal == null && Math.isNaN(delta)) continue;
+          var stOp:Dynamic = {f: fieldName, dur: dur, ease: ease, delay: delay};
+          if (refVal != null)
+          {
+            set(stOp, 'tbl', get(refVal, 'tbl'));
+            set(stOp, 'col', get(refVal, 'col'));
+          }
+          else set(stOp, 'v', delta);
+          if (delayTbl != '')
+          {
+            set(stOp, 'delayTbl', delayTbl);
+            set(stOp, 'delayCol', delayCol);
+          }
+          if (condTbl2 != '')
+          {
+            set(stOp, 'ifTbl', condTbl2);
+            set(stOp, 'ifCol', condIdx);
+            set(stOp, 'ifWant', condWant);
+          }
+          addBeatOpLoop(program, beatCase, target, 'scaleTo', stOp, loopVar, loopList, tables);
+        }
+        else if (fieldName == 'x' || fieldName == 'y')
+        {
+          if (refVal != null)
+          {
+            var twOp:Dynamic = {field: fieldName, dur: dur, ease: ease, delay: delay};
+            if (get(refVal, 'abs') == true)
+            {
+              set(twOp, 'tbl', get(refVal, 'tbl'));
+              set(twOp, 'col', get(refVal, 'col'));
+            }
+            else
+            {
+              set(twOp, 'ref', get(refVal, 'ref'));
+              set(twOp, 'refField', get(refVal, 'refField'));
+              set(twOp, 'tbl', get(refVal, 'tbl'));
+              set(twOp, 'col', get(refVal, 'col'));
+              set(twOp, 'sign', get(refVal, 'sign'));
+            }
+            if (delayTbl != '')
+            {
+              set(twOp, 'delayTbl', delayTbl);
+              set(twOp, 'delayCol', delayCol);
+            }
+            if (condTbl2 != '')
+            {
+              set(twOp, 'ifTbl', condTbl2);
+              set(twOp, 'ifCol', condIdx);
+              set(twOp, 'ifWant', condWant);
+            }
+            addBeatOpLoop(program, beatCase, target, 'tweenRef', twOp, loopVar, loopList, tables);
+          }
+          else if (!Math.isNaN(delta))
+          {
+            addBeatOpLoop(program, beatCase, target, 'tween', {field: fieldName, delta: delta, dur: dur, ease: ease, delay: delay}, loopVar, loopList, tables);
+          }
+        }
+      }
+    }
+  }
+
+  // Resolve a tween field expression driven by a loop-table cell:
+  // 'dad.y + offsets[a][3]' or a bare 'offsets[a][2]'. Returns
+  // {tbl, col, abs, ref, refField, sign} or null when not table-based (the
+  // caller then falls back to static delta extraction).
+  function parseTweenRefExpr(expr:String, loopVar:String, tables:Dynamic):Dynamic
+  {
+    if (loopVar == '' || loopVar == 'null' || expr == '') return null;
+    var t:String = StringTools.trim(expr);
+    var lv:String = '[' + loopVar + ']';
+    var lvPos:Int = t.indexOf(lv);
+    if (lvPos < 0) return null;
+    // The cell must immediately follow: 'TBL[loopVar][K]'.
+    var cellOpen:Int = lvPos + lv.length;
+    if (cellOpen >= t.length || t.charAt(cellOpen) != '[') return null;
+    var cellClose:Int = t.indexOf(']', cellOpen);
+    if (cellClose < 0) return null;
+    var col:Int = Std.parseInt(t.substring(cellOpen + 1, cellClose));
+    if (col == null || col < 0) return null;
+    var tStart:Int = lvPos - 1;
+    while (tStart >= 0 && isIdentChar(t.charAt(tStart))) tStart--;
+    var tbl:String = t.substring(tStart + 1, lvPos);
+    if (tbl == '' || get(tables, tbl) == null) return null;
+    var result:Dynamic = {tbl: tbl, col: col, abs: true, ref: '', refField: '', sign: '+'};
+    // 'REF.field +/- TBL[loopVar][K]' (value relative to a runtime actor).
+    var left:String = StringTools.trim(t.substring(0, tStart + 1));
+    var opIdx:Int = -1;
+    for (li in 1...left.length)
+    {
+      if (left.charAt(li) == '+' || left.charAt(li) == '-') opIdx = li;
+    }
+    if (opIdx > 0)
+    {
+      var sign:String = left.charAt(opIdx) == '-' ? '-' : '+';
+      var refExpr:String = StringTools.trim(left.substring(0, opIdx));
+      var dot:Int = refExpr.indexOf('.');
+      if (dot > 0)
+      {
+        var ref:String = StringTools.trim(refExpr.substring(0, dot));
+        var refField:String = StringTools.trim(refExpr.substring(dot + 1));
+        if (ref != '' && refField != '')
+        {
+          set(result, 'abs', false);
+          set(result, 'ref', ref);
+          set(result, 'refField', refField);
+          set(result, 'sign', sign);
+        }
+      }
+    }
+    return result;
+  }
+
+  // Delta of a tween field expression: '<ref>.<dir> - 455' -> -455.
+  function exprDelta(expr:String):Float
+  {
+    var t:String = StringTools.trim(expr);
+    var lastOp:Int = -1;
+    for (i in 1...t.length)
+    {
+      if (t.charAt(i) == '+' || t.charAt(i) == '-') lastOp = i;
+    }
+    if (lastOp > 0)
+    {
+      var tail:String = StringTools.trim(t.substring(lastOp + 1));
+      var n:Float = Std.parseFloat(tail);
+      if (!Math.isNaN(n)) return t.charAt(lastOp) == '-' ? -n : n;
+    }
+    var direct:Float = Std.parseFloat(t);
+    return Math.isNaN(direct) ? Math.NaN : direct;
+  }
+
+  // Read an 'ease: X' field from a tween options object.
+  function attrFromObj(opts:String, key:String):String
+  {
+    if (opts == '') return '';
+    var keyIdx:Int = opts.indexOf(key + ':');
+    if (keyIdx < 0) return '';
+    var rest:String = StringTools.trim(opts.substring(keyIdx + key.length + 1));
+    if (rest == '') return '';
+    var cut:Int = rest.indexOf(',');
+    if (cut < 0) cut = rest.indexOf('}');
+    if (cut < 0) cut = rest.length;
+    var val:String = StringTools.trim(rest.substring(0, cut));
+    return stripQuotes(val);
+  }
+
+  function numFromObj(opts:String, key:String, fallback:Float):Float
+  {
+    var s:String = attrFromObj(opts, key);
+    if (s == '') return fallback;
+    var n:Float = Std.parseFloat(s);
+    return Math.isNaN(n) ? fallback : n;
+  }
+
+  // Extract the quoted argument of a path call like Paths.image('...').
+  function extractPathCall(text:String, callName:String):String
+  {
+    var ci:Int = text.indexOf(callName);
+    if (ci < 0) return '';
+    var p:Int = text.indexOf('(', ci);
+    if (p < 0) return '';
+    var rest:String = text.substring(p + 1);
+    var q1:Int = rest.indexOf("'");
+    var quote:String = "'";
+    var qAlt:Int = rest.indexOf('"');
+    if (qAlt >= 0 && (q1 < 0 || qAlt < q1)) { q1 = qAlt; quote = '"'; }
+    if (q1 < 0) return '';
+    var q2:Int = rest.indexOf(quote, q1 + 1);
+    if (q2 <= q1) return '';
+    return rest.substring(q1 + 1, q2);
+  }
+
+  // ------------------------------------------------------------------
+  // Stages (XML -> JSON)
+  // ------------------------------------------------------------------
   public function convertStages(dir:String, out:Dynamic):Void
   {
     var stagesRoot:String = 'mods/$dir/data/stages';
@@ -2939,7 +4525,7 @@ class FunkyCompatCodename
       placeAnchor(stageId, get(charBodies, 'dad'), characters, 'dad', dadZ, 100, 100, 1);
       placeAnchor(stageId, get(charBodies, 'gf'), characters, 'gf', gfZ, 400, 130, 0.95);
 
-      if (stageId == "awesomestage")
+      if (stageId == 'awesomestage')
       {
         // Hardcode positions for awesomestage to fix floating (universal ground planting broke other stages)
         var bfFix:Dynamic = get(characters, 'bf');
@@ -3063,6 +4649,14 @@ class FunkyCompatCodename
       if (stageId != baseId && StringTools.startsWith(rel, oldRoot))
         keyRel = 'stages/$stageId' + rel.substring(oldRoot.length);
       addImage(out, dir, '$diskRel.png', '$keyRel.png');
+      // Stage scripts often animate a Paths.image(...) sprite (Codename
+      // addAnim needs atlas frames) whose sheet+XML live next to the file:
+      // register the sibling atlas so getSparrowAtlas resolves for it.
+      var xmlText2:String = util.readText('mods/$dir/images/$diskRel.xml');
+      if (xmlText2 != null)
+      {
+        out.texts.push({paths: util.imageKeys('$keyRel.xml'), content: xmlText2});
+      }
     }
   }
 
@@ -3299,7 +4893,7 @@ class FunkyCompatCodename
       if (manifest != null)
       {
         var frames:Dynamic = get(manifest, 'frames');
-        var keys:Array<String> = Reflect.fields(frames);
+        var keys:Array<String> = ReflectUtil.fields(frames);
         if (keys.length > 0)
         {
           var first:Dynamic = get(frames, keys[0]);

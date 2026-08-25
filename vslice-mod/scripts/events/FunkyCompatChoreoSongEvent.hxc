@@ -1,0 +1,726 @@
+// funky-compat - universal Codename song-choreography player.
+//
+// Codename songs drive stage/character choreography from HScript (song
+// scripts like scripts/events.hx and stage scripts) that V-Slice cannot
+// execute. At import time FunkyCompatCodename extracts the PORTABLE subset
+// (sprite/character creation, beat-triggered visibility/tweens/flips,
+// event-driven playAnim calls) into a data program; this song event plays it
+// back at runtime. Everything is defensive: unknown targets, missing assets
+// or unsupported ops degrade silently instead of failing the song.
+//
+//   { 'e': 'FunkyCompatChoreo', 'v': { 'sprites': [...], 'characters': [...],
+//                                       'beats': [...], 'camAnims': [...],
+//                                       'calls': {...}, 'order': [...] } }
+//
+//   sprites/characters: {name,x,y,xRef,img|charId,atlas,anims,visible,
+//                        flipX,scaleX,scaleY,antialias,before,z}
+//   beats:  [ {beat, ops:[{target,op,value}]} ]
+//   camAnims: [ {param, target, anim} ]   // Camera Movement param -> playAnim
+//   calls:  { fnName: [ {target,op,value} ] }   // HScript Call bodies
+//
+// op values: 'visible' (bool), 'flipX' (bool), 'swapLR', 'playAnim' (name),
+// 'tween' {field,delta,dur,ease,delay}, 'scaleTo' {f,v,dur,ease,delay},
+// 'tweenRef' {field,ref,refField,tbl,col,sign,dur,ease,delay} (a tween whose
+// end value is 'REF.<field> +/- tables[tbl][row][col]', one row per actor).
+// 'tween'/'scaleTo'/'tweenRef' values may also carry delayTbl/delayCol
+// (per-entry startDelay) and ifTbl/ifCol/ifWant (per-entry branch test).
+// Targets resolve to: created actors by name ('dupes[i]' indexes them in
+// creation order; 'dupes[a]' with a non-numeric index expands to every actor
+// pushed into that runtime array), the stage's bf/dad/gf characters, or a
+// named stage prop.
+
+import funkin.play.event.SongEvent;
+import funkin.play.PlayState;
+import flixel.FlxG;
+import flixel.FlxSprite;
+import flixel.tweens.FlxTween;
+import flixel.tweens.FlxEase;
+import StringTools;
+import funkin.Paths;
+import funkin.util.ReflectUtil;
+import funkin.play.character.SparrowCharacter;
+
+class FunkyCompatChoreoSongEvent extends SongEvent
+{
+  // name -> created sprite/character instance.
+  var refs:Dynamic;
+  // Created instances in creation order (array-index targeting).
+  var created:Array<Dynamic>;
+  var program:Dynamic;
+  var built:Bool;
+  // FlxEase lookup for tween easing (the haxe.Reflect module is not
+  // importable from scripts, so names resolve against this table; unknown
+  // names fall back to linear).
+  var easeLookup:Dynamic;
+  // Camera-side tracking for 'Camera Movement' reactions (the source
+  // scripts only fire their look-anim when the camera SIDE changes, e.g.
+  // madstage's onEvent: onRight != (onRight = params[0] != 0)).
+  var lastCamRight:Bool;
+
+  public function new()
+  {
+    super('FunkyCompatChoreo');
+    this.refs = {};
+    this.created = [];
+    this.program = null;
+    this.built = false;
+    this.lastCamRight = false;
+    this.easeLookup = {
+      quadIn: FlxEase.quadIn,
+      quadOut: FlxEase.quadOut,
+      quadInOut: FlxEase.quadInOut,
+      sineIn: FlxEase.sineIn,
+      sineOut: FlxEase.sineOut,
+      sineInOut: FlxEase.sineInOut,
+      cubeIn: FlxEase.cubeIn,
+      cubeOut: FlxEase.cubeOut,
+      cubeInOut: FlxEase.cubeInOut,
+      quartIn: FlxEase.quartIn,
+      quartOut: FlxEase.quartOut,
+      quartInOut: FlxEase.quartInOut,
+      quintIn: FlxEase.quintIn,
+      quintOut: FlxEase.quintOut,
+      quintInOut: FlxEase.quintInOut,
+      expoIn: FlxEase.expoIn,
+      expoOut: FlxEase.expoOut,
+      expoInOut: FlxEase.expoInOut,
+      circIn: FlxEase.circIn,
+      circOut: FlxEase.circOut,
+      circInOut: FlxEase.circInOut,
+      backIn: FlxEase.backIn,
+      backOut: FlxEase.backOut,
+      backInOut: FlxEase.backInOut,
+      elasticIn: FlxEase.elasticIn,
+      elasticOut: FlxEase.elasticOut,
+      elasticInOut: FlxEase.elasticInOut,
+      bounceIn: FlxEase.bounceIn,
+      bounceOut: FlxEase.bounceOut,
+      bounceInOut: FlxEase.bounceInOut,
+      smoothStep: FlxEase.smoothStep,
+      smootherStep: FlxEase.smootherStep
+    };
+  }
+
+  public function getTitle():String
+  {
+    return 'Choreography (funky-compat)';
+  }
+
+  public function getEventSchema():Dynamic
+  {
+    return [];
+  }
+
+  override function handleEvent(data:Dynamic):Void
+  {
+    if (data == null || data.value == null) return;
+    this.program = data.value;
+    this.built = false;
+    this.lastCamRight = false;
+  }
+
+  // ------------------------------------------------------------------
+  // Construction
+  // ------------------------------------------------------------------
+
+  function ensureBuilt():Void
+  {
+    if (this.built) return;
+    this.built = true;
+    this.refs = {};
+    this.created = [];
+    if (this.program == null || PlayState.instance == null) return;
+
+    // Build in SCRIPT creation order (program.order), so array-indexed
+    // targets ('dupes[i]') resolve to the same actors the HScript pushed.
+    var order:Array<Dynamic> = get(this.program, 'order');
+    if (order == null) return;
+    for (spec in order)
+    {
+      if (spec == null) continue;
+      var name:String = Std.string(get(spec, 'name'));
+      if (name == '' || name == 'null') continue;
+      var target:Dynamic = null;
+      var charId:String = Std.string(get(spec, 'charId'));
+      if (charId != '' && charId != 'null')
+      {
+        try
+        {
+          target = new SparrowCharacter(charId);
+        }
+        catch (e:Dynamic)
+        {
+          target = null;
+        }
+        if (target == null)
+        {
+          // The extra actors are optional - a character that cannot be
+          // constructed (missing data, unexpected render type) degrades to
+          // being absent rather than failing the whole song.
+          continue;
+        }
+      }
+      else
+      {
+        target = new FlxSprite(0, 0);
+        var img:String = Std.string(get(spec, 'img'));
+        var atlas:String = Std.string(get(spec, 'atlas'));
+        var anims:Array<Dynamic> = get(spec, 'anims');
+        var loadedFrames:Bool = false;
+        try
+        {
+          if (atlas != null && atlas != '' && atlas != 'null')
+          {
+            target.frames = Paths.getSparrowAtlas(atlas);
+            loadedFrames = true;
+          }
+          // Scripts that animate a Paths.image(...) sprite (Codename's
+          // addAnim needs atlas frames) actually ship a sheet+XML pair;
+          // load it as an atlas so the extracted anims play instead of
+          // drawing the whole sheet as one graphic.
+          else if (img != '' && img != 'null' && anims != null && anims.length > 0)
+          {
+            try
+            {
+              target.frames = Paths.getSparrowAtlas(img);
+              loadedFrames = true;
+            }
+            catch (e:Dynamic)
+            {
+              loadedFrames = false;
+            }
+          }
+          if (loadedFrames)
+          {
+            var anims2:Array<Dynamic> = anims;
+            if (anims2 == null) anims2 = [];
+            for (an in anims2)
+            {
+              if (an == null) continue;
+              try
+              {
+                target.animation.addByPrefix(Std.string(get(an, 'name')), Std.string(get(an, 'prefix')), util_f(get(an, 'fps'), 24), get(an, 'loop') == true);
+              }
+              catch (e:Dynamic) {}
+            }
+          }
+          else if (img != '' && img != 'null')
+          {
+            target.loadGraphic(Paths.image(img), false);
+          }
+        }
+        catch (e:Dynamic) {}
+      }
+      if (target == null) continue;
+      applyBaseState(target, spec);
+      placeProp(target, spec);
+      set(this.refs, name, target);
+      this.created.push(target);
+    }
+  }
+
+  // Position (honoring a runtime-relative xRef), visibility, flip, scale.
+  function applyBaseState(target:Dynamic, spec:Dynamic):Void
+  {
+    target.x = util_f(get(spec, 'x'), 0);
+    target.y = util_f(get(spec, 'y'), 0);
+    var xRef:String = Std.string(get(spec, 'xRef'));
+    if (xRef != '' && xRef != 'null')
+    {
+      var base:Dynamic = resolveTarget(xRef);
+      if (base != null && base.x != null) target.x = base.x + target.x;
+    }
+    var vis:Dynamic = get(spec, 'visible');
+    if (vis != null) target.visible = vis == true;
+    var fl:Dynamic = get(spec, 'flipX');
+    if (fl != null) target.flipX = fl == true;
+    target.scale.set(util_f(get(spec, 'scaleX'), 1), util_f(get(spec, 'scaleY'), 1));
+    target.antialiasing = get(spec, 'antialias') != false;
+    try { target.updateHitbox(); } catch (e:Dynamic) {}
+  }
+
+  // Insert a created actor in front of a named stage prop (or at a zIndex).
+  function placeProp(spr:Dynamic, spec:Dynamic):Void
+  {
+    if (PlayState.instance == null || PlayState.instance.currentStage == null) return;
+    var stage:Dynamic = PlayState.instance.currentStage;
+    var z:Int = Std.int(util_f(get(spec, 'z'), 150));
+    var before:String = Std.string(get(spec, 'before'));
+    if (before != '' && before != 'null')
+    {
+      var prop:Dynamic = null;
+      try { prop = stage.getNamedProp(before); } catch (e:Dynamic) { prop = null; }
+      if (prop != null)
+      {
+        // The stage sorts by zIndex; the extraction's 'z' is the '+N'
+        // display-list offset from the named prop, so the actor sits N
+        // layers above it (below the characters, which use 100-300).
+        var idx:Int = stage.members.indexOf(prop);
+        if (idx >= 0) stage.insert(idx + (z >= 1 ? z : 1), spr);
+        else stage.add(spr);
+        spr.zIndex = Std.int(prop.zIndex) + (z >= 1 ? z : 1);
+        return;
+      }
+    }
+    stage.add(spr);
+    spr.zIndex = z;
+  }
+
+  // ------------------------------------------------------------------
+  // Beat choreography
+  // ------------------------------------------------------------------
+
+  override function onBeatHit(event:Dynamic):Void
+  {
+    ensureBuilt();
+    if (this.program == null) return;
+    var beat:Int = event == null || event.beat == null ? -1 : event.beat;
+    if (beat < 0) return;
+    var beats:Array<Dynamic> = get(this.program, 'beats');
+    if (beats == null) return;
+    for (entry in beats)
+    {
+      if (entry == null) continue;
+      if (Std.int(util_f(get(entry, 'beat'), -1)) != beat) continue;
+      var ops:Array<Dynamic> = get(entry, 'ops');
+      if (ops == null) continue;
+      for (op in ops)
+      {
+        if (op != null) applyOp(op);
+      }
+    }
+  }
+
+  function applyOp(op:Dynamic):Void
+  {
+    var kind:String = Std.string(get(op, 'op'));
+    var targetName:String = Std.string(get(op, 'target'));
+    var target:Dynamic = resolveTarget(targetName);
+    if (target != null)
+    {
+      applyOpTo(target, op, kind);
+      return;
+    }
+    // 'dupes[a]' with a loop-variable index: expand onto every actor of the
+    // array group (each reads its own table row for per-entry values).
+    var group:Array<Dynamic> = resolveGroup(targetName);
+    if (group != null)
+    {
+      for (g in group)
+      {
+        if (g != null) applyOpTo(g, op, kind);
+      }
+    }
+  }
+
+  function applyOpTo(actor:Dynamic, op:Dynamic, kind:String):Void
+  {
+    var row:Int = rowOf(actor);
+    // Per-entry branch predicate ('if (!offsets[a][6]) FlxTween.tween(...)')
+    // only runs for the table rows matching the condition.
+    var ifTbl:String = Std.string(get(op, 'ifTbl'));
+    if (ifTbl != '' && ifTbl != 'null')
+    {
+      var ifCol:Int = Std.int(util_f(get(op, 'ifCol'), -1));
+      if (ifCol >= 0)
+      {
+        var bit:Dynamic = tableCell(ifTbl, row, ifCol);
+        var isTrue:Bool = bit == true || bit == 1;
+        if (isTrue != (get(op, 'ifWant') == true)) return;
+      }
+    }
+    // Per-entry start delays: 'startDelay: offsets[a][5]'.
+    var delayOverride:Dynamic = null;
+    var dTbl:String = Std.string(get(op, 'delayTbl'));
+    if (dTbl != '' && dTbl != 'null')
+    {
+      var dCol:Int = Std.int(util_f(get(op, 'delayCol'), 0));
+      delayOverride = tableCell(dTbl, row, dCol);
+    }
+    if (kind == 'tween')
+    {
+      var tw:Dynamic = get(op, 'value');
+      if (actor == null || tw == null) return;
+      var field:String = Std.string(get(tw, 'field'));
+      var delta:Float = util_f(get(tw, 'delta'), 0);
+      tweenTo(actor, field, ReflectUtil.getField(actor, field) + delta, tw, delayOverride);
+      return;
+    }
+    if (kind == 'tweenRef')
+    {
+      var tr:Dynamic = get(op, 'value');
+      if (actor == null || tr == null) return;
+      var field2:String = Std.string(get(tr, 'field'));
+      var to:Float = resolveTweenRefValue(tr, row);
+      if (Math.isNaN(to)) return;
+      tweenTo(actor, field2, to, tr, delayOverride);
+      return;
+    }
+    if (kind == 'scaleTo')
+    {
+      var st:Dynamic = get(op, 'value');
+      if (actor == null || st == null || actor.scale == null) return;
+      var sf:String = Std.string(get(st, 'f'));
+      var sv:Float = util_f(get(st, 'v'), 1);
+      var stTbl:String = Std.string(get(st, 'tbl'));
+      if (stTbl != '' && stTbl != 'null')
+      {
+        var cellV:Dynamic = tableCell(stTbl, row, Std.int(util_f(get(st, 'col'), 0)));
+        if (cellV != null) sv = util_f(cellV, sv);
+      }
+      tweenTo(actor.scale, sf, sv, st, delayOverride);
+      return;
+    }
+    if (actor == null) return;
+    switch (kind)
+    {
+      case 'visible':
+        actor.visible = get(op, 'value') == true;
+      case 'flipX':
+        actor.flipX = get(op, 'value') == true;
+      case 'swapLR':
+        try
+        {
+          if (actor.swapLeftRightAnimations != null) actor.swapLeftRightAnimations();
+        }
+        catch (e:Dynamic) {}
+      case 'playAnim':
+        // Clear any pending completion hook first, so only an explicitly
+        // paired 'nextAnim' survives (camera look-anims must not trigger a
+        // stale follow-up like rompstar's shake).
+        try
+        {
+          actor.animation.finishCallback = null;
+          actor.animation.play(Std.string(get(op, 'value')), true);
+        }
+        catch (e:Dynamic) {}
+      case 'nextAnim':
+        // Play this animation when the target's CURRENT (non-looping)
+        // animation completes - the Codename finishCallback pattern
+        // (madstage: inv finishes, rompstar shakes).
+        var nextName:String = Std.string(get(op, 'value'));
+        if (nextName == '' || nextName == 'null') return;
+        try
+        {
+          var ctrl:Dynamic = actor.animation;
+          if (ctrl != null)
+          {
+            ctrl.finishCallback = function():Void
+            {
+              try
+              {
+                ctrl.finishCallback = null;
+                actor.animation.play(nextName, true);
+              }
+              catch (e:Dynamic) {}
+            };
+          }
+        }
+        catch (e:Dynamic) {}
+    }
+  }
+
+  function tweenTo(target:Dynamic, field:String, to:Float, spec:Dynamic, delayOverride:Dynamic):Void
+  {
+    var dur:Float = util_f(get(spec, 'dur'), 1);
+    var delay:Float = delayOverride != null ? util_f(delayOverride, 0) : util_f(get(spec, 'delay'), 0);
+    var easeName:String = Std.string(get(spec, 'ease'));
+    var ease:Dynamic = FlxEase.linear;
+    if (easeName != '' && easeName != 'null' && easeName != 'linear')
+    {
+      try
+      {
+        var found:Dynamic = ReflectUtil.getField(this.easeLookup, easeName);
+        if (found != null) ease = found;
+      }
+      catch (e:Dynamic)
+      {
+        ease = FlxEase.linear;
+      }
+    }
+    try
+    {
+      var tweenData:Dynamic = {};
+      ReflectUtil.setAnonymousField(tweenData, field, to);
+      FlxTween.tween(target, tweenData, dur, {ease: ease, startDelay: delay});
+    }
+    catch (e:Dynamic) {}
+  }
+
+  // ------------------------------------------------------------------
+  // Event-driven animations (e.g. stage sprite reacts to Camera Movement)
+  // ------------------------------------------------------------------
+
+  override function onSongEvent(event:Dynamic):Void
+  {
+    ensureBuilt();
+    if (this.program == null || event == null) return;
+    var data:Dynamic = event.eventData;
+    if (data == null) return;
+    var kind:String = Std.string(data.eventKind);
+    // 'HScript Call' chart events were mapped to FunkyCompatChoreoCall:
+    // replay the portable actions extracted from the named function body
+    // immediately (same frame, no queueing).
+    if (kind == 'FunkyCompatChoreoCall')
+    {
+      var callFn:String = data.value == null ? '' : Std.string(data.value.fn);
+      if (callFn != '' && callFn != 'null')
+      {
+        var ops:Array<Dynamic> = get(get(this.program, 'calls'), callFn);
+        if (ops != null)
+        {
+          for (op in ops)
+          {
+            if (op != null) applyOp(op);
+          }
+        }
+      }
+      return;
+    }
+    if (kind != 'FocusCamera') return;
+    var value:Dynamic = data.value;
+    if (value == null || value.char == null) return;
+    // V-Slice char numbering (0 = player, 1 = opponent) -> Codename
+    // strumline numbering (0 = opponent, 1 = player), which camAnims are
+    // keyed by. param -1 acts as the fallback for every other line.
+    var charIdx:Int = Std.int(value.char);
+    var codenameLine:Int = charIdx == 0 ? 1 : (charIdx == 1 ? 0 : charIdx);
+    // Like the source scripts (onRight != (onRight = params[0] != 0)),
+    // only react when the camera actually SWITCHED sides - repeated events
+    // for the same side must not restart the look animation.
+    var nowRight:Bool = codenameLine != 0;
+    if (nowRight == this.lastCamRight) return;
+    this.lastCamRight = nowRight;
+    var camAnims:Array<Dynamic> = get(this.program, 'camAnims');
+    if (camAnims == null) return;
+    // Line-specific entries win; the param -1 fallback only fires when no
+    // specific entry covers this camera line (otherwise lines with both
+    // would double-play the animations back to back).
+    var hasExact:Bool = false;
+    for (entry in camAnims)
+    {
+      if (entry == null) continue;
+      if (Std.int(util_f(get(entry, 'param'), -99)) == codenameLine) hasExact = true;
+    }
+    for (entry in camAnims)
+    {
+      if (entry == null) continue;
+      var param:Int = Std.int(util_f(get(entry, 'param'), -99));
+      if (param == codenameLine) {}
+      else if (param == -1 && hasExact) continue;
+      else if (param != -1) continue;
+      var target:Dynamic = resolveTarget(Std.string(get(entry, 'target')));
+      if (target == null) continue;
+      try { target.animation.play(Std.string(get(entry, 'anim')), true); } catch (e:Dynamic) {}
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // HScript Call bodies (delivered through SongEvent callbacks)
+  // ------------------------------------------------------------------
+
+  override function onSongEnd(event:Dynamic):Void
+  {
+    // Created actors live on the stage and die with it.
+  }
+
+  // ------------------------------------------------------------------
+  // Helpers
+  // ------------------------------------------------------------------
+
+  function resolveTarget(name:String):Dynamic
+  {
+    if (name == '' || name == 'null') return null;
+    // 'dupes[i]' - index among the loop-created actors, in script creation
+    // order (those are the ones scripts push into arrays).
+    var br:Int = name.indexOf('[');
+    if (br > 0 && StringTools.endsWith(name, ']'))
+    {
+      var idxText:String = StringTools.trim(name.substring(br + 1, name.length - 1));
+      var idx:Int = idxText != '' ? Std.parseInt(idxText) : -1;
+      if (idx >= 0)
+      {
+        var refs2:Array<Dynamic> = this.created;
+        var loopActors:Array<Dynamic> = [];
+        if (this.program != null && get(this.program, 'order') != null)
+        {
+          var order:Array<Dynamic> = get(this.program, 'order');
+          for (i in 0...order.length)
+          {
+            if (i < this.created.length && get(order[i], 'fromLoop') == true) loopActors.push(this.created[i]);
+          }
+        }
+        if (idx < loopActors.length) return loopActors[idx];
+        if (idx < refs2.length) return refs2[idx];
+      }
+      return null;
+    }
+    var cached:Dynamic = get(this.refs, name);
+    if (cached != null) return cached;
+    if (PlayState.instance == null || PlayState.instance.currentStage == null) return null;
+    var stage:Dynamic = PlayState.instance.currentStage;
+    switch (name)
+    {
+      case 'bf' | 'boyfriend' | 'player':
+        return stage.getBoyfriend();
+      case 'dad' | 'opponent':
+        return stage.getDad();
+      case 'gf' | 'girlfriend':
+        return stage.getGirlfriend();
+    }
+    try
+    {
+      var prop:Dynamic = stage.getNamedProp(name);
+      if (prop != null) return prop;
+    }
+    catch (e:Dynamic) {}
+    return null;
+  }
+
+  // Expand 'BASE[<loopVar>]' targets onto the created actors that belong to
+  // that runtime array (recorded from 'arr.push(...)' at extraction). When no
+  // array membership was captured, falls back to every loop-created actor
+  // (script creation order then mirrors the loop push order). Non-array
+  // targets that failed resolveTarget return null here too.
+  function resolveGroup(name:String):Array<Dynamic>
+  {
+    if (name == null || name == '' || name == 'null') return null;
+    var br:Int = name.indexOf('[');
+    if (br <= 0 || !StringTools.endsWith(name, ']')) return null;
+    var base:String = name.substring(0, br);
+    var idxText:String = StringTools.trim(name.substring(br + 1, name.length - 1));
+    if (idxText != '')
+    {
+      var idxNum:Int = Std.parseInt(idxText);
+      if (idxNum != null && idxNum >= 0) return null; // numeric index -> single actor
+    }
+    if (this.program == null) return null;
+    var order:Array<Dynamic> = get(this.program, 'order');
+    if (order == null) return null;
+    var result:Array<Dynamic> = [];
+    var anyGroups:Bool = false;
+    for (i in 0...order.length)
+    {
+      if (i >= this.created.length) break;
+      if (order[i] == null || this.created[i] == null) continue;
+      var groups:Array<Dynamic> = get(order[i], 'groups');
+      if (groups != null && groups.length > 0)
+      {
+        anyGroups = true;
+        if (groups.indexOf(base) >= 0) result.push(this.created[i]);
+      }
+    }
+    if (!anyGroups)
+    {
+      for (i in 0...order.length)
+      {
+        if (i >= this.created.length) break;
+        if (order[i] != null && get(order[i], 'fromLoop') == true) result.push(this.created[i]);
+      }
+    }
+    return result.length > 0 ? result : null;
+  }
+
+  // The loop-table row a created actor was made from (its loopIdx), used to
+  // read per-entry tween values/delays.
+  function rowOf(actor:Dynamic):Int
+  {
+    var idx:Int = this.created.indexOf(actor);
+    if (idx < 0 || this.program == null) return 0;
+    var order:Array<Dynamic> = get(this.program, 'order');
+    if (order == null || idx >= order.length || order[idx] == null) return 0;
+    var li:Dynamic = get(order[idx], 'loopIdx');
+    var row:Int = Std.int(util_f(li, 0));
+    return row >= 0 ? row : 0;
+  }
+
+  // One cell of an extracted loop table ('offsets[row][col]').
+  function tableCell(tbl:String, row:Int, col:Int):Dynamic
+  {
+    try
+    {
+      if (this.program == null) return null;
+      var tables:Dynamic = get(this.program, 'tables');
+      if (tables == null) return null;
+      var t:Dynamic = get(tables, tbl);
+      if (t == null || row < 0 || t.length <= row) return null;
+      var r:Dynamic = t[row];
+      if (r == null || col < 0 || r.length <= col) return null;
+      return r[col];
+    }
+    catch (e:Dynamic) {}
+    return null;
+  }
+
+  // Absolute end value of a table-driven tween: the row cell itself
+  // ('offsets[a][3]') or 'REF.field +/- cell' ('dad.y + offsets[a][3]').
+  function resolveTweenRefValue(tw:Dynamic, row:Int):Float
+  {
+    var tbl:String = Std.string(get(tw, 'tbl'));
+    if (tbl == '' || tbl == 'null') return Math.NaN;
+    var cell:Dynamic = tableCell(tbl, row, Std.int(util_f(get(tw, 'col'), 0)));
+    if (cell == null) return Math.NaN;
+    var cellV:Float = util_f(cell, 0);
+    var ref:String = Std.string(get(tw, 'ref'));
+    var refField:String = Std.string(get(tw, 'refField'));
+    if (ref == '' || ref == 'null' || refField == '' || refField == 'null') return cellV;
+    var base:Dynamic = resolveTarget(ref);
+    if (base == null) return Math.NaN;
+    try
+    {
+      var baseV:Float = util_f(ReflectUtil.getField(base, refField), 0);
+      return Std.string(get(tw, 'sign')) == '-' ? baseV - cellV : baseV + cellV;
+    }
+    catch (e:Dynamic) {}
+    return Math.NaN;
+  }
+
+  function get(o:Dynamic, k:String):Dynamic
+  {
+    return ReflectUtil.getField(o, k);
+  }
+
+  // Field writes through the anonymous-object helper (hscript's implicit
+  // 'set' resolves to an inaccessible global; define it locally instead).
+  function set(o:Dynamic, k:String, v:Dynamic):Void
+  {
+    ReflectUtil.setAnonymousField(o, k, v);
+  }
+
+  function util_f(v:Dynamic, d:Float):Float
+  {
+    if (v == null) return d;
+    var n:Float = Std.parseFloat(Std.string(v));
+    if (Math.isNaN(n)) return d;
+    return n;
+  }
+}
+
+// Dedicated handler for 'FunkyCompatChoreoCall' events. The choreography
+// player consumes these through its own onSongEvent callback; this class
+// exists so the engine's registry has a handler for the event kind (no
+// "No event handler" warnings) and cleanly absorbs the dispatch.
+class FunkyCompatChoreoCallSongEvent extends SongEvent
+{
+  public function new()
+  {
+    super('FunkyCompatChoreoCall');
+  }
+
+  public function getTitle():String
+  {
+    return 'Choreography Call (funky-compat)';
+  }
+
+  public function getEventSchema():Dynamic
+  {
+    return [];
+  }
+
+  // The base class throws unless handleEvent is overridden; this shell only
+  // exists so the engine has a registered handler for the event kind (the
+  // choreography player consumes the event through its onSongEvent hook).
+  override function handleEvent(data:Dynamic):Void
+  {
+  }
+}
